@@ -109,6 +109,9 @@ pub struct Config {
     /// Longest rest length a newly grown muscle may have. Without it, regrown muscles copy
     /// whatever distance their nodes have drifted to, and creatures sprawl without bound.
     pub max_muscle_length: f32,
+    /// Whether children can gain or lose nodes and muscles. The original only does this in
+    /// Cary Huang's version; here it is on for both presets.
+    pub mutate_topology: bool,
 }
 
 impl Config {
@@ -130,6 +133,7 @@ impl Config {
             seed_mode: SeedMode::Truss { rows: 2, cols: 2 },
             inheritance: MuscleInheritance::Regrow,
             max_muscle_length: 2.0,
+            mutate_topology: true,
         }
     }
 
@@ -365,6 +369,8 @@ impl Creature {
             for m in &self.muscles {
                 child.muscles.push(mutate_muscle(m, node_num, mu * mf, rng));
             }
+        }
+        if cfg.mutate_topology {
             let p = 0.04 * mu * mf;
             if rng.unit() < p || child.nodes.len() <= 2 {
                 child.add_random_node(rng, cfg);
@@ -865,6 +871,20 @@ mod tests {
             let last = pop.history.last().unwrap().percentiles[14];
             assert!(last.is_finite());
             assert!(last >= first, "median went from {first} to {last}");
+        }
+    }
+
+    #[test]
+    fn topology_mutates_in_both_presets() {
+        for cfg in [Config::cary_huang(), Config::evolution3web()] {
+            let mut cfg = cfg;
+            cfg.population = 200;
+            let mut pop = Population::new(cfg, 42);
+            for _ in 0..30 {
+                pop.step();
+            }
+            let first = pop.creatures[0].nodes.len();
+            assert!(pop.creatures.iter().any(|c| c.nodes.len() != first), "node count never changed");
         }
     }
 

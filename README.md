@@ -15,6 +15,7 @@ the original's rank-pairing lottery, then each survivor is cloned once and has o
     cargo run --release -- --cary       # Cary Huang's original settings
     cargo run --release -- --seed 38 --pop 500
     cargo run --release -- --max-len 6     # allow longer muscles (default 2.0)
+    cargo run --release -- --fixed-topology  # never add/remove nodes or muscles
 
 ## Controls
 
@@ -68,6 +69,9 @@ nodes/muscles added and removed by mutation, overlapping muscles pruned, flat gr
   nodes have drifted to, so without the cap creatures sprawl to 100+ units across after a few
   hundred generations, and that sprawl is how they score 15–20 m. With the cap they stay
   compact, but the evolution3WEB preset plateaus near 1 m; `--max-len` trades one for the other.
+- Topology mutation (adding/removing nodes and muscles) runs in both presets. In evolution3WEB
+  it was skipped along with the muscle-mutation loop, so every creature stayed at four nodes.
+  `--fixed-topology` turns it off.
 
 ## License
 
