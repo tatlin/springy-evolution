@@ -106,6 +106,9 @@ pub struct Config {
     pub sim_steps: u32,
     pub seed_mode: SeedMode,
     pub inheritance: MuscleInheritance,
+    /// Longest rest length a newly grown muscle may have. Without it, regrown muscles copy
+    /// whatever distance their nodes have drifted to, and creatures sprawl without bound.
+    pub max_muscle_length: f32,
 }
 
 impl Config {
@@ -126,6 +129,7 @@ impl Config {
             sim_steps: 900,
             seed_mode: SeedMode::Truss { rows: 2, cols: 2 },
             inheritance: MuscleInheritance::Regrow,
+            max_muscle_length: 2.0,
         }
     }
 
@@ -245,7 +249,7 @@ impl Creature {
         };
         c.settle(cfg);
         c.check_for_overlap(true);
-        c.check_for_lone_nodes(rng);
+        c.check_for_lone_nodes(rng, cfg);
         c
     }
 
@@ -366,7 +370,7 @@ impl Creature {
                 child.add_random_node(rng, cfg);
             }
             if rng.unit() < p {
-                child.add_random_muscle(rng, None);
+                child.add_random_muscle(rng, cfg, None);
             }
             if rng.unit() < p && child.nodes.len() >= 4 {
                 child.remove_random_node(rng);
@@ -376,7 +380,7 @@ impl Creature {
             }
             child.check_for_overlap(true);
         }
-        child.check_for_lone_nodes(rng);
+        child.check_for_lone_nodes(rng, cfg);
         child.settle(cfg);
         child
     }
@@ -403,7 +407,7 @@ impl Creature {
         }
     }
 
-    fn check_for_lone_nodes(&mut self, rng: &mut Rng) {
+    fn check_for_lone_nodes(&mut self, rng: &mut Rng, cfg: &Config) {
         let n = self.nodes.len();
         if n < 3 {
             return;
@@ -425,7 +429,7 @@ impl Creature {
                 while other == i || Some(other) == connected_to {
                     other = rng.index(n);
                 }
-                self.add_random_muscle(rng, Some((i, other)));
+                self.add_random_muscle(rng, cfg, Some((i, other)));
             }
         }
     }
@@ -454,11 +458,11 @@ impl Creature {
                 }
             }
         }
-        self.add_random_muscle(rng, Some((parent, new)));
-        self.add_random_muscle(rng, Some((closest, new)));
+        self.add_random_muscle(rng, cfg, Some((parent, new)));
+        self.add_random_muscle(rng, cfg, Some((closest, new)));
     }
 
-    fn add_random_muscle(&mut self, rng: &mut Rng, ends: Option<(usize, usize)>) {
+    fn add_random_muscle(&mut self, rng: &mut Rng, cfg: &Config, ends: Option<(usize, usize)>) {
         let (c1, c2) = ends.unwrap_or_else(|| {
             let c1 = rng.index(self.nodes.len());
             let mut c2 = c1;
@@ -470,6 +474,9 @@ impl Creature {
         let (a, b) = (self.nodes[c1], self.nodes[c2]);
         let dist = ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt();
         let ratio = rng.range(0.01, 0.2);
+        // Cap the base length so even the extended muscle stays within `max_muscle_length`;
+        // `settle()` then pulls far-apart nodes back together.
+        let dist = dist.min(cfg.max_muscle_length / (1.0 + ratio));
         let t1 = rng.unit();
         let t2 = rng.unit();
         self.muscles.push(Muscle {
@@ -858,6 +865,24 @@ mod tests {
             let last = pop.history.last().unwrap().percentiles[14];
             assert!(last.is_finite());
             assert!(last >= first, "median went from {first} to {last}");
+        }
+    }
+
+    #[test]
+    fn creatures_stay_compact() {
+        for cfg in [Config::cary_huang(), Config::evolution3web()] {
+            let mut cfg = cfg;
+            cfg.population = 200;
+            let mut pop = Population::new(cfg, 42);
+            for _ in 0..150 {
+                pop.step();
+            }
+            for c in &pop.creatures {
+                let (lo, hi) = c.nodes.iter().fold((f32::MAX, f32::MIN), |(lo, hi), n| {
+                    (lo.min(n.x.min(n.y)), hi.max(n.x.max(n.y)))
+                });
+                assert!(hi - lo < 10.0, "creature {} spans {} units", c.id, hi - lo);
+            }
         }
     }
 }

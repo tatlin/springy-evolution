@@ -46,6 +46,8 @@ struct Evo {
     cfg: Config,
     seed: u64,
     population_size: usize,
+    /// `--max-len` override for `Config::max_muscle_length`.
+    max_muscle_length: Option<f32>,
     /// `None` while a generation is being computed on the worker thread.
     pop: Option<Population>,
     worker: Option<JoinHandle<Population>>,
@@ -57,9 +59,12 @@ struct Evo {
 }
 
 impl Evo {
-    fn new(preset: Preset, seed: u64, population_size: usize) -> Self {
+    fn new(preset: Preset, seed: u64, population_size: usize, max_muscle_length: Option<f32>) -> Self {
         let mut cfg = preset.config();
         cfg.population = population_size.max(2);
+        if let Some(len) = max_muscle_length {
+            cfg.max_muscle_length = len.max(0.5);
+        }
         let pop = Population::new(cfg.clone(), seed);
         Self {
             preview: pop.creatures[0].clone(),
@@ -67,6 +72,7 @@ impl Evo {
             cfg,
             seed,
             population_size,
+            max_muscle_length,
             pop: Some(pop),
             worker: None,
             history: Vec::new(),
@@ -153,7 +159,9 @@ fn main() {
     });
     let population: usize = parse_arg(&args, "--pop").unwrap_or(1000);
 
-    let evo = Evo::new(preset, seed, population);
+    let max_muscle_length = parse_arg(&args, "--max-len");
+
+    let evo = Evo::new(preset, seed, population, max_muscle_length);
     let playback = Playback::new(&evo.preview, "Generation 1, creature #1 (untested)".into());
 
     App::new()
@@ -360,7 +368,7 @@ fn input(
         };
         let seed = evo.seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         // Any running worker is detached; its result is simply dropped.
-        *evo = Evo::new(preset, seed, evo.population_size);
+        *evo = Evo::new(preset, seed, evo.population_size, evo.max_muscle_length);
         view.selected_gen = None;
         *playback = Playback::new(&evo.preview, "Generation 1, creature #1 (untested)".into());
         commands.run_system_cached(spawn_obstacles);

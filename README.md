@@ -14,6 +14,7 @@ the original's rank-pairing lottery, then each survivor is cloned once and has o
     cargo run --release                 # evolution3WEB settings (default)
     cargo run --release -- --cary       # Cary Huang's original settings
     cargo run --release -- --seed 38 --pop 500
+    cargo run --release -- --max-len 6     # allow longer muscles (default 2.0)
 
 ## Controls
 
@@ -62,6 +63,11 @@ nodes/muscles added and removed by mutation, overlapping muscles pruned, flat gr
 - `checkForOverlap()` can remove extra muscles in the original when a muscle is flagged twice;
   each muscle is removed at most once here.
 - The RNG is splitmix64, so seeds won't reproduce the Processing runs.
+- Newly grown muscles are capped at `max_muscle_length` (2.0, the same limit the original's
+  `modifyMuscle()` clamps to). In evolution3WEB a regrown muscle copies whatever distance its
+  nodes have drifted to, so without the cap creatures sprawl to 100+ units across after a few
+  hundred generations, and that sprawl is how they score 15–20 m. With the cap they stay
+  compact, but the evolution3WEB preset plateaus near 1 m; `--max-len` trades one for the other.
 
 ## License
 
