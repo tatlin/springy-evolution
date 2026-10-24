@@ -1,0 +1,15 @@
+[package]
+name = "springy-evolution"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-or-later"
+description = "Rust + Bevy port of Cary Huang's Evolution Simulator (via tatlin/evolution3WEB)"
+
+[dependencies]
+bevy = "0.20"
+
+# The simulation is hot; keep deps optimized even in dev builds.
+[profile.dev]
+opt-level = 1
+[profile.dev.package."*"]
+opt-level = 3
