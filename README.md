@@ -61,8 +61,11 @@ minor scale. Falling back behind the furthest post plays a downward "bwomp", and
 behind the start line gets a sad trombone. A generation whose best is more than 5% worse than the
 previous generation's plays a soft deflating "wah-wah". Each of these, and the fanfare, is
 rate-limited so auto-run and rocking creatures don't repeat them. Landing sounds stop above 4×
-playback, and the progress sounds stop in instant playback. A gentle procedural loop plays underneath as music. In the
-browser, sound starts after your first key press or click.
+playback, and the progress sounds stop in instant playback. A gentle procedural loop plays
+underneath as music. In the browser, sound starts after your first key press or click.
+
+[docs/sounds.md](docs/sounds.md) lists every sound the game uses or will need, with specs for
+replacing the synthesized ones with designed audio.
 
 ## Layout
 

@@ -25,9 +25,12 @@ browser at <https://tatlin.github.io/springy-evolution/>.
   `NewRecord` and `Regressed`), and the plugin decides what to play and rate-limits repeats.
   Thresholds that decide *whether* something happened (`SLIP_SLACK`, `REGRESSION_DROP`) live
   in `main.rs`, and the repeat gaps live in `audio.rs`. Add new progress sounds as `Milestone`
-  variants rather than new message types, so systems stay under Bevy's argument limit. All sound is a `Synth` asset (a custom
-  `Decodable`) generated in code, one tiny asset per one-shot, plus an endless procedural music
-  loop. `AudioSettings` holds mute, the music and effects volumes, and `unlocked`.
+  variants rather than new message types, so systems stay under Bevy's argument limit. All
+  sound is a `Synth` asset (a custom `Decodable`) generated in code, one tiny asset per one-shot,
+  plus an endless procedural music loop. `AudioSettings` holds mute, the music and effects
+  volumes, and `unlocked`.
+- `docs/sounds.md`: the sound-design list (what plays now, what's planned, specs for a designer).
+  Update its status column when you add or replace a sound.
 - `web/index.html`: the page that loads the wasm build, focuses Bevy's canvas, and resumes the
   AudioContext on the first input.
 - `.github/workflows/pages.yml`: builds wasm and deploys to GitHub Pages on every push to `main`.
