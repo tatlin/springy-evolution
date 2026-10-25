@@ -1,0 +1,11 @@
+(
+    name: "Staircase",
+    blurb: "Three steps up, then keep climbing to the flag.",
+    goal: 4.0,
+    stars: (three: 45, two: 60),
+    obstacles: [
+        (x: 1.0, width: 30.0, height: 0.04),
+        (x: 1.5, width: 30.0, height: 0.08),
+        (x: 2.0, width: 30.0, height: 0.12),
+    ],
+)

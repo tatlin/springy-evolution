@@ -1,10 +1,13 @@
 //! Bevy front end: watch creatures run, breed generations in the background, plot progress.
 
 mod audio;
+mod levels;
 
 use audio::{AudioSettings, Landed, Milestone, SoundPlugin};
+use bevy::asset::AssetMetaCheck;
 use bevy::input::mouse::AccumulatedMouseScroll;
 use bevy::prelude::*;
+use levels::{Level, LevelList, LevelsPlugin, Screen};
 use springy_evolution::sim::{self, Config, Creature, GenStats, Population, Sim};
 
 /// Pixels per simulation unit (1 unit = 20 cm), same as the original's camzoom of 0.01.
@@ -55,18 +58,62 @@ impl Preset {
     }
 }
 
-#[derive(Resource)]
-struct Evo {
+/// How to build a run: free play with the preset and command-line overrides, or a level.
+#[derive(Clone)]
+struct Setup {
     preset: Preset,
-    cfg: Config,
-    seed: u64,
-    population_size: usize,
+    population: usize,
     /// `--max-len` override for `Config::max_muscle_length`.
     max_muscle_length: Option<f32>,
     /// `--fixed-topology`: never add or remove nodes and muscles.
     fixed_topology: bool,
     /// `--min-connections` override for `Config::min_connections`.
     min_connections: Option<usize>,
+    level: Option<LevelRun>,
+}
+
+#[derive(Clone)]
+struct LevelRun {
+    /// Position in `LevelList`.
+    index: usize,
+    level: Level,
+}
+
+impl Setup {
+    fn config(&self) -> Config {
+        // Levels ignore the preset and the command line, so their stars mean the same thing for
+        // everyone: evolution3WEB settings with the level's obstacles and population.
+        if let Some(run) = &self.level {
+            let mut cfg = Config::evolution3web();
+            cfg.population = run.level.population().max(2);
+            cfg.rects = run.level.rects();
+            return cfg;
+        }
+        let mut cfg = self.preset.config();
+        cfg.population = self.population.max(2);
+        cfg.mutate_topology = !self.fixed_topology;
+        if let Some(n) = self.min_connections {
+            cfg.min_connections = n;
+        }
+        if let Some(len) = self.max_muscle_length {
+            cfg.max_muscle_length = len.max(0.5);
+        }
+        cfg
+    }
+}
+
+/// Free play's setup and seed, from the command line.
+#[derive(Resource)]
+struct FreePlay {
+    setup: Setup,
+    seed: u64,
+}
+
+#[derive(Resource)]
+struct Evo {
+    setup: Setup,
+    cfg: Config,
+    seed: u64,
     /// `None` while a generation is being computed by `worker`.
     pop: Option<Population>,
     worker: Option<Worker>,
@@ -75,41 +122,25 @@ struct Evo {
     preview: Creature,
     auto: bool,
     generations_queued: u32,
+    /// How many generations it took to reach the level's goal.
+    finished_at: Option<usize>,
 }
 
 impl Evo {
-    fn new(
-        preset: Preset,
-        seed: u64,
-        population_size: usize,
-        max_muscle_length: Option<f32>,
-        fixed_topology: bool,
-        min_connections: Option<usize>,
-    ) -> Self {
-        let mut cfg = preset.config();
-        cfg.population = population_size.max(2);
-        cfg.mutate_topology = !fixed_topology;
-        if let Some(n) = min_connections {
-            cfg.min_connections = n;
-        }
-        if let Some(len) = max_muscle_length {
-            cfg.max_muscle_length = len.max(0.5);
-        }
+    fn new(setup: Setup, seed: u64) -> Self {
+        let cfg = setup.config();
         let pop = Population::new(cfg.clone(), seed);
         Self {
             preview: pop.creatures[0].clone(),
-            preset,
+            setup,
             cfg,
             seed,
-            population_size,
-            max_muscle_length,
-            fixed_topology,
-            min_connections,
             pop: Some(pop),
             worker: None,
             history: Vec::new(),
             auto: false,
             generations_queued: 0,
+            finished_at: None,
         }
     }
 
@@ -243,6 +274,8 @@ struct Obstacle;
 #[derive(Component)]
 struct Hud;
 #[derive(Component)]
+struct GraphBackdrop;
+#[derive(Component)]
 struct DistanceLabel;
 #[derive(Component)]
 struct DistanceArrow;
@@ -266,8 +299,9 @@ fn main() {
     let fixed_topology = args.iter().any(|a| a == "--fixed-topology");
     let min_connections = parse_arg(&args, "--min-connections");
 
-    let evo =
-        Evo::new(preset, seed, population, max_muscle_length, fixed_topology, min_connections);
+    let free =
+        Setup { preset, population, max_muscle_length, fixed_topology, min_connections, level: None };
+    let evo = Evo::new(free.clone(), seed);
     let playback = Playback::new(&evo.preview, "Generation 1, creature #1 (untested)".into());
 
     App::new()
@@ -280,8 +314,13 @@ fn main() {
                 ..default()
             }),
             ..default()
+        }).set(AssetPlugin {
+            // There are no .meta files, and on the web each check is a failed HTTP request.
+            meta_check: AssetMetaCheck::Never,
+            ..default()
         }))
-        .add_plugins(SoundPlugin)
+        .add_plugins((SoundPlugin, LevelsPlugin))
+        .insert_resource(FreePlay { setup: free, seed })
         .insert_resource(ClearColor(Color::srgb_u8(120, 200, 255)))
         .insert_resource(evo)
         .insert_resource(playback)
@@ -291,8 +330,8 @@ fn main() {
         .add_systems(
             Update,
             (
-                input,
-                poll_worker,
+                input.run_if(in_state(Screen::Level)),
+                poll_worker.run_if(in_state(Screen::Level)),
                 step_playback,
                 draw_creature,
                 follow_camera,
@@ -317,6 +356,7 @@ fn setup(
             cam.spawn((
                 Sprite::from_color(Color::srgba(1.0, 1.0, 1.0, 0.75), Vec2::new(480.0, 230.0)),
                 Transform::from_xyz(390.0, 220.0, -10.0),
+                GraphBackdrop,
             ));
         });
 
@@ -370,6 +410,7 @@ fn setup(
     ));
 }
 
+/// Obstacles, plus the goal flag in a level. Respawned whenever a run starts.
 fn spawn_obstacles(mut commands: Commands, evo: Res<Evo>, old: Query<Entity, With<Obstacle>>) {
     for e in &old {
         commands.entity(e).despawn();
@@ -378,11 +419,67 @@ fn spawn_obstacles(mut commands: Commands, evo: Res<Evo>, old: Query<Entity, Wit
         let size = Vec2::new((r.x2 - r.x1) * S, (r.y2 - r.y1) * S);
         let centre = to_world((r.x1 + r.x2) / 2.0, (r.y1 + r.y2) / 2.0);
         commands.spawn((
-            Sprite::from_color(Color::srgb_u8(0, 130, 0), size),
+            // A shade darker than the ground, so roofs and steps read as obstacles.
+            Sprite::from_color(Color::srgb_u8(0, 100, 0), size),
             Transform::from_translation(centre.extend(0.5)),
             Obstacle,
         ));
     }
+    if let Some(run) = &evo.setup.level {
+        let x = run.level.goal * 5.0;
+        let red = Color::srgb_u8(230, 40, 40);
+        commands.spawn((
+            Sprite::from_color(Color::WHITE, Vec2::new(0.08 * S, 4.0 * S)),
+            Transform::from_translation(to_world(x, -2.0).extend(0.4)),
+            Obstacle,
+        ));
+        commands.spawn((
+            Sprite::from_color(red, Vec2::new(1.4 * S, 0.8 * S)),
+            Transform::from_translation(to_world(x + 0.7, -3.6).extend(0.4)),
+            Obstacle,
+        ));
+        commands.spawn((
+            Text2d::new("GOAL"),
+            TextFont::from_font_size(40.0),
+            TextColor(Color::WHITE),
+            Transform::from_translation(to_world(x + 0.7, -3.6).extend(0.45)),
+            Obstacle,
+        ));
+    }
+}
+
+/// Start a fresh run of `setup`, watching an untested creature until the first generation is in.
+fn start_run(
+    In((setup, seed)): In<(Setup, u64)>,
+    mut evo: ResMut<Evo>,
+    mut view: ResMut<View>,
+    mut playback: ResMut<Playback>,
+    mut commands: Commands,
+) {
+    // Any running worker is detached; its result is simply dropped.
+    *evo = Evo::new(setup, seed);
+    view.selected_gen = None;
+    *playback = Playback::new(&evo.preview, "Generation 1, creature #1 (untested)".into());
+    commands.run_system_cached(spawn_obstacles);
+}
+
+/// Start level `index` of `LevelList`, or free play for `None`.
+fn enter_level(
+    In(index): In<Option<usize>>,
+    levels: Res<LevelList>,
+    assets: Res<Assets<Level>>,
+    free: Res<FreePlay>,
+    mut commands: Commands,
+) {
+    let (setup, seed) = match index {
+        Some(i) => {
+            let Some(level) = levels.0.get(i).and_then(|h| assets.get(h)) else { return };
+            let run = LevelRun { index: i, level: level.clone() };
+            (Setup { level: Some(run), ..free.setup.clone() }, random_seed())
+        }
+        None => (free.setup.clone(), free.seed),
+    };
+    commands.run_system_cached_with(start_run, (setup, seed));
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -468,28 +565,19 @@ fn input(
     z -= scroll.delta.y.clamp(-5.0, 5.0) * 0.05;
     view.zoom = (view.zoom * (1.0 + z)).clamp(0.3, 8.0);
 
-    // Restart (R) or switch preset (P).
+    // Restart (R), or switch preset (P) in free play.
     let restart = keys.just_pressed(KeyCode::KeyR);
-    let switch = keys.just_pressed(KeyCode::KeyP);
+    let switch = keys.just_pressed(KeyCode::KeyP) && evo.setup.level.is_none();
     if restart || switch {
-        let preset = match (switch, evo.preset) {
-            (false, p) => p,
-            (true, Preset::Evolution3Web) => Preset::CaryHuang,
-            (true, Preset::CaryHuang) => Preset::Evolution3Web,
-        };
+        let mut setup = evo.setup.clone();
+        if switch {
+            setup.preset = match setup.preset {
+                Preset::Evolution3Web => Preset::CaryHuang,
+                Preset::CaryHuang => Preset::Evolution3Web,
+            };
+        }
         let seed = evo.seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        // Any running worker is detached; its result is simply dropped.
-        *evo = Evo::new(
-            preset,
-            seed,
-            evo.population_size,
-            evo.max_muscle_length,
-            evo.fixed_topology,
-            evo.min_connections,
-        );
-        view.selected_gen = None;
-        *playback = Playback::new(&evo.preview, "Generation 1, creature #1 (untested)".into());
-        commands.run_system_cached(spawn_obstacles);
+        commands.run_system_cached_with(start_run, (setup, seed));
         return;
     }
 
@@ -502,10 +590,12 @@ fn input(
 
 fn poll_worker(
     mut evo: ResMut<Evo>,
-    view: Res<View>,
+    mut view: ResMut<View>,
     mut playback: ResMut<Playback>,
     mut milestones: MessageWriter<Milestone>,
+    mut screen: ResMut<NextState<Screen>>,
 ) {
+    let mut goal = false;
     let finished = evo.worker.take().and_then(|w| w.poll().map_err(|w| evo.worker = Some(w)).ok());
     if let Some(pop) = finished {
         if let Some(stats) = pop.latest() {
@@ -519,11 +609,27 @@ fn poll_worker(
                 }
             }
             evo.history.push(stats.clone());
+            // Reaching a level's goal stops evolving and shows the results over the winning run.
+            let target = evo.setup.level.as_ref().map(|run| run.level.goal);
+            if let Some(target) = target
+                && evo.finished_at.is_none()
+                && best >= target
+            {
+                evo.finished_at = Some(evo.history.len());
+                evo.auto = false;
+                evo.generations_queued = 0;
+                view.selected_gen = None;
+                view.which = Which::Best;
+                goal = true;
+                milestones.write(Milestone::GoalReached);
+                screen.set(Screen::Results);
+            }
         }
         evo.pop = Some(pop);
         // When following the latest generation, start watching the new champion — but don't
         // interrupt a replay in progress while auto-running unless it has finished.
-        if view.selected_gen.is_none() && (!evo.auto || playback.hold > 0.0 || evo.history.len() == 1)
+        if goal
+            || view.selected_gen.is_none() && (!evo.auto || playback.hold > 0.0 || evo.history.len() == 1)
         {
             if let Some((c, label)) = watch_target(&evo, &view) {
                 *playback = Playback::new(&c, label);
@@ -786,8 +892,22 @@ fn follow_camera(
     }
 }
 
-fn draw_graph(evo: Res<Evo>, view: Res<View>, cam: Query<&Transform, With<Camera2d>>, mut g: Gizmos) {
+fn draw_graph(
+    evo: Res<Evo>,
+    view: Res<View>,
+    screen: Res<State<Screen>>,
+    cam: Query<&Transform, With<Camera2d>>,
+    mut backdrop: Query<&mut Visibility, With<GraphBackdrop>>,
+    mut g: Gizmos,
+) {
     let Ok(cam) = cam.single() else { return };
+    let in_menu = *screen.get() == Screen::Menu;
+    for mut vis in &mut backdrop {
+        *vis = if in_menu { Visibility::Hidden } else { Visibility::Inherited };
+    }
+    if in_menu {
+        return;
+    }
     let h = &evo.history;
     if h.len() < 2 {
         return;
@@ -832,10 +952,30 @@ fn update_hud(
     view: Res<View>,
     pb: Res<Playback>,
     sound: Res<AudioSettings>,
-    mut hud: Query<&mut Text, With<Hud>>,
+    screen: Res<State<Screen>>,
+    mut hud: Query<(&mut Text, &mut Visibility), With<Hud>>,
 ) {
-    let Ok(mut text) = hud.single_mut() else { return };
-    let mut s = format!("{}\n", evo.preset.name());
+    let Ok((mut text, mut vis)) = hud.single_mut() else { return };
+    // The menu sits over the running creature; keep the screen clear for it.
+    *vis = if *screen.get() == Screen::Menu { Visibility::Hidden } else { Visibility::Inherited };
+    let mut s = match &evo.setup.level {
+        Some(run) => {
+            let l = &run.level;
+            let mut s = format!(
+                "Level {}: {}   goal {} m   3 stars within {} generations, 2 within {}\n",
+                run.index + 1,
+                l.name,
+                l.goal,
+                l.stars.three,
+                l.stars.two
+            );
+            if let Some(gens) = evo.finished_at {
+                s += &format!("Goal reached in generation {gens}. Keep evolving to see how far it goes.\n");
+            }
+            s
+        }
+        None => format!("Free play: {}\n", evo.setup.preset.name()),
+    };
     match evo.history.last() {
         Some(st) => s += &format!(
             "Generations: {}   best {:.3} m   median {:.3} m   worst {:.3} m   top species S{:02}\n",
@@ -845,7 +985,7 @@ fn update_hud(
             st.percentiles[28],
             st.top_species
         ),
-        None => s += &format!("Generations: 0   ({} untested creatures)\n", evo.population_size),
+        None => s += &format!("Generations: 0   ({} untested creatures)\n", evo.cfg.population),
     }
     let status = match (evo.busy(), evo.auto) {
         (true, true) => "auto-running…",
@@ -866,7 +1006,7 @@ fn update_hud(
         (true, false) => format!("Sound: music {}%   effects {}%\n", pct(sound.music), pct(sound.sfx)),
     };
     s += "[Space] next gen   [A] auto   [1/2/3] best/median/worst   [←/→/End] browse gens\n\
-          [↑/↓] speed   [Enter] replay   [wheel or -/=] zoom   [P] switch preset   [R] restart\n\
-          [M] mute   [,/.] music volume   [[/]] effects volume";
+          [↑/↓] speed   [Enter] replay   [wheel or -/=] zoom   [R] restart   [Esc] level select\n\
+          [P] switch preset (free play)   [M] mute   [,/.] music volume   [[/]] effects volume";
     text.0 = s;
 }

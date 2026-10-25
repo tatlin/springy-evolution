@@ -11,6 +11,9 @@ the original's rank-pairing lottery, then each survivor is cloned once and has o
 
 ## Run
 
+The game opens on a level-select menu: four obstacle courses, plus free play. The run flags below
+only affect free play; levels always use the same settings so their stars are comparable.
+
     cargo run --release                 # evolution3WEB settings (default)
     cargo run --release -- --cary       # Cary Huang's original settings
     cargo run --release -- --seed 38 --pop 500
@@ -30,12 +33,47 @@ main thread, about 10 ms per frame, instead of on a worker. To build it locally 
     cargo build --profile web --target wasm32-unknown-unknown
     wasm-bindgen --target web --no-typescript --out-dir dist \
       target/wasm32-unknown-unknown/web/springy-evolution.wasm
-    cp web/index.html dist/ && python3 -m http.server -d dist
+    cp web/index.html dist/ && cp -r assets dist/ && python3 -m http.server -d dist
+
+## Levels
+
+Each course is a file in `assets/levels/`: a goal distance, obstacles, and how many generations
+earn three and two stars. When a generation's best creature reaches the goal, evolution stops and
+a results screen shows your stars over the winning run. From there you can keep evolving, retry
+with a new seed, go on to the next level, or return to the menu. The menu shows your best stars
+this session (they aren't saved yet).
+
+| Level | Course | Goal |
+|---|---|---|
+| 1. First Steps | flat ground | 3 m |
+| 2. Low Bridge | a roof 25 cm off the ground from 1 m to 3 m | 4 m |
+| 3. Staircase | three 4 cm steps up | 4 m |
+| 4. Speed Bumps | three 4 cm bumps | 4 m |
+
+Levels use the evolution3WEB settings with a population of 500. The star thresholds were set by
+evolving each course from 10 seeds: three stars covers about the best 40% of seeds, two stars
+about 80%. A level file looks like this (distances in metres, y up):
+
+    (
+        name: "Low Bridge",
+        blurb: "Mind your head: a low roof from 1 m to 3 m.",
+        goal: 4.0,
+        stars: (three: 30, two: 40),
+        obstacles: [
+            (x: 1.0, width: 2.0, height: 1.0, lift: 0.25),  // lift raises it off the ground
+        ],
+        // population: 500,  // optional
+    )
+
+Natively, saving a level file while you play it restarts the level with the new layout. To add a
+level, add its file to `LEVEL_FILES` in `src/levels.rs` (the browser can't list a folder).
 
 ## Controls
 
 | Key | Action |
 |---|---|
+| 1–4, F | menu: start a level, or free play |
+| Esc | back to the level select |
 | Space | simulate one generation (queues if pressed repeatedly) |
 | A | auto-run generations continuously |
 | 1 / 2 / 3 | watch the best / median / worst creature |
@@ -43,18 +81,22 @@ main thread, about 10 ms per frame, instead of on a worker. To build it locally 
 | ↑ / ↓ | playback speed (1× … 64×, or instant) |
 | Enter | replay |
 | Mouse wheel, − / = | zoom |
-| P | switch preset and restart |
+| P | switch preset and restart (free play) |
 | R | restart with a new seed |
 | M | mute / unmute |
 | , / . | music volume down / up |
 | [ / ] | effects volume down / up |
+
+On the results screen: Space keeps evolving, Enter retries, N goes to the next level, and Esc
+returns to the menu. Menu and results buttons can also be clicked.
 
 ## Sound
 
 Everything you hear is synthesized in code (`src/audio.rs`), so the web build downloads no
 audio files. Nodes thud when they land, louder the harder they hit and deeper for grippy black
 feet. Each new metre post rings a bell that climbs a pentatonic scale, and a generation that beats
-the best distance so far plays a short fanfare.
+the best distance so far plays a short fanfare. Finishing a level plays a longer one that lands
+on a ringing chord.
 
 Going backwards has its own, quieter sounds. Posts behind the start ring a bell that descends a
 minor scale. Falling back behind the furthest post plays a downward "bwomp", and a run that ends
@@ -76,6 +118,8 @@ replacing the synthesized ones with designed audio.
 - `src/main.rs` — Bevy front end. Generations run on a worker thread so the window never stalls.
   Playback follows real time at any frame rate (60 sim steps per second at 1×).
 - `src/audio.rs` — synthesized sound effects, procedural music, and the volume controls.
+- `src/levels.rs` — level files, the menu and results screens, and stars.
+- `assets/levels/` — the courses.
 
 ## The two presets
 

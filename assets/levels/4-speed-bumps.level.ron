@@ -1,0 +1,11 @@
+(
+    name: "Speed Bumps",
+    blurb: "Three little bumps. Don't trip.",
+    goal: 4.0,
+    stars: (three: 48, two: 62),
+    obstacles: [
+        (x: 1.0, width: 0.1, height: 0.04),
+        (x: 2.0, width: 0.1, height: 0.04),
+        (x: 3.0, width: 0.1, height: 0.04),
+    ],
+)

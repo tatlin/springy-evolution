@@ -42,6 +42,8 @@ pub enum Milestone {
     NewRecord,
     /// A generation's best did clearly worse than the previous generation's.
     Regressed,
+    /// A generation reached the level's goal.
+    GoalReached,
 }
 
 #[derive(Resource)]
@@ -195,6 +197,11 @@ fn play_sfx(
     let mut metre = None;
     for m in milestones.read() {
         match *m {
+            Milestone::GoalReached => {
+                // Drowns out the record fanfare it usually arrives with.
+                state.last_fanfare = now;
+                play(Synth::Goal, 0.5, 1.0);
+            }
             Milestone::NewRecord if now - state.last_fanfare > FANFARE_GAP => {
                 state.last_fanfare = now;
                 play(Synth::Fanfare, 0.4, 1.0);
@@ -263,6 +270,8 @@ enum Synth {
     Ding { freq: f32 },
     /// A rising arpeggio.
     Fanfare,
+    /// A longer arpeggio that lands on a ringing chord, for finishing a level.
+    Goal,
     /// A quick downward "bwomp".
     Slip,
     /// A soft, deflating "wah-wah".
@@ -280,6 +289,7 @@ impl Synth {
             Synth::Thud { .. } => Some(0.25),
             Synth::Ding { .. } => Some(1.4),
             Synth::Fanfare => Some(1.0),
+            Synth::Goal => Some(2.4),
             Synth::Slip => Some(0.3),
             Synth::Deflate => Some(0.9),
             Synth::Trombone => Some(2.1),
@@ -382,6 +392,25 @@ impl Iterator for SynthDecoder {
                 }
                 s * 0.5
             }
+            Synth::Goal => {
+                const RUN: [f32; 5] = [67.0, 72.0, 76.0, 79.0, 84.0];
+                const CHORD: [f32; 3] = [72.0, 76.0, 84.0];
+                const GAP: f32 = 0.08;
+                let mut s = 0.0;
+                for (i, note) in RUN.iter().enumerate() {
+                    let start = i as f32 * GAP;
+                    if t >= start {
+                        s += 0.5 * pluck(midi_hz(*note), t - start, 9.0);
+                    }
+                }
+                let start = RUN.len() as f32 * GAP;
+                if t >= start {
+                    for note in CHORD {
+                        s += 0.3 * pluck(midi_hz(note), t - start, 1.8);
+                    }
+                }
+                s * release(t, 2.4)
+            }
             Synth::Slip => {
                 let p = self.advance(170.0 + 380.0 * (-t * 10.0).exp());
                 attack(t) * release(t, 0.3) * (TAU * p).sin()
@@ -472,6 +501,7 @@ mod tests {
             Synth::Ding { freq: metre_pitch(30) },
             Synth::Ding { freq: metre_pitch(-30) },
             Synth::Fanfare,
+            Synth::Goal,
             Synth::Slip,
             Synth::Deflate,
             Synth::Trombone,

@@ -7,6 +7,13 @@ description = "Rust + Bevy port of Cary Huang's Evolution Simulator (via tatlin/
 
 [dependencies]
 bevy = "0.20"
+# Level files (assets/levels/*.level.ron). Both are already in the tree via Bevy.
+ron = "0.12"
+serde = { version = "1", features = ["derive"] }
+
+# Hot-reload level files while designing them. There's no file watcher on the web.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+bevy = { version = "0.20", features = ["file_watcher"] }
 
 # Already in the tree via Bevy's web backend; used for a random seed in the browser.
 [target.'cfg(target_arch = "wasm32")'.dependencies]

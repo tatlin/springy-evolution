@@ -1,0 +1,10 @@
+(
+    name: "Low Bridge",
+    blurb: "Mind your head: a low roof from 1 m to 3 m.",
+    goal: 4.0,
+    stars: (three: 30, two: 40),
+    obstacles: [
+        // A roof 0.25 m off the ground, 1 m thick.
+        (x: 1.0, width: 2.0, height: 1.0, lift: 0.25),
+    ],
+)

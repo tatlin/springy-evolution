@@ -45,6 +45,7 @@ jobs:
           wasm-bindgen --target web --no-typescript --out-dir dist \
             target/wasm32-unknown-unknown/web/springy-evolution.wasm
           cp web/index.html dist/
+          cp -r assets dist/
           ls -la dist
 
       - uses: actions/upload-pages-artifact@v3

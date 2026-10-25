@@ -46,14 +46,14 @@ nothing plays yet.
 | UI tick | Planned | Changing speed, best/median/worst, browsing generations | Tiny, neutral click, 2–3 variations |
 | Volume step / mute | Planned | M, `,` `.` `[` `]` | Short blip at the new effects level |
 
-## 3. Obstacle courses (next on the roadmap)
+## 3. Obstacle courses (screens are in; most sounds aren't)
 
 | Sound | Status | Trigger | Character |
 |---|---|---|---|
 | Menu music | Planned | Level-select screen | Calmer loop, can share a theme with the in-level music |
 | Menu hover / select / back | Planned | bevy_ui buttons | One consistent family of three UI sounds |
 | Level start | Planned | Entering a course | Short "ready, go" sting |
-| Goal reached | Planned | A creature crosses the goal distance | Bigger payoff than the record fanfare, 2–3 s |
+| Goal reached | Synth | A generation's best reaches the level's goal | Bigger payoff than the record fanfare, 2–3 s. The placeholder is an arpeggio landing on a ringing chord. |
 | Star awarded ×3 | Planned | Results screen, one per star | Rising pitch per star, so it works as a sequence |
 | Results music | Planned | Results screen | 10–20 s resolving sting, or a short loop |
 | Locked level | Planned | Clicking a locked level | Gentle "nope" thunk |

@@ -1,0 +1,10 @@
+// Flat ground: learn what evolution does. Distances are in metres; obstacles sit on the ground
+// unless `lift` raises them. Saving this file while the game runs reloads the level.
+(
+    name: "First Steps",
+    blurb: "Flat ground. Just get moving.",
+    goal: 3.0,
+    // Most generations allowed for three and two stars. Finishing at all earns one.
+    stars: (three: 10, two: 16),
+    obstacles: [],
+)
