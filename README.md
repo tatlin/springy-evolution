@@ -54,8 +54,14 @@ main thread, about 10 ms per frame, instead of on a worker. To build it locally 
 Everything you hear is synthesized in code (`src/audio.rs`), so the web build downloads no
 audio files. Nodes thud when they land, louder the harder they hit and deeper for grippy black
 feet. Each new metre post rings a bell that climbs a pentatonic scale, and a generation that beats
-the best distance so far plays a short fanfare. Landing sounds stop above 4× playback, and the
-bells stop in instant playback. A gentle procedural loop plays underneath as music. In the
+the best distance so far plays a short fanfare.
+
+Going backwards has its own, quieter sounds. Posts behind the start ring a bell that descends a
+minor scale. Falling back behind the furthest post plays a downward "bwomp", and a run that ends
+behind the start line gets a sad trombone. A generation whose best is more than 5% worse than the
+previous generation's plays a soft deflating "wah-wah". Each of these, and the fanfare, is
+rate-limited so auto-run and rocking creatures don't repeat them. Landing sounds stop above 4×
+playback, and the progress sounds stop in instant playback. A gentle procedural loop plays underneath as music. In the
 browser, sound starts after your first key press or click.
 
 ## Layout

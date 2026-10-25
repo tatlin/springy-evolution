@@ -20,8 +20,12 @@ browser at <https://tatlin.github.io/springy-evolution/>.
   a dead-zone, critically damped camera (`CameraRig`, `smooth_damp`). `step_playback` owes sim
   steps from `Time` (`STEP_RATE` = 60/s at 1×), so playback speed doesn't depend on frame rate,
   and it writes the audio messages as it steps.
-- `src/audio.rs`: `SoundPlugin`. Gameplay writes `Landed`, `MetrePassed` and `NewRecord`
-  messages, and the plugin decides what to play. All sound is a `Synth` asset (a custom
+- `src/audio.rs`: `SoundPlugin`. Gameplay writes `Landed` (one per node landing) and `Milestone`
+  messages (`Metre(i32)`, with negative posts behind the start, plus `SlippedBack`, `EndedBehind`,
+  `NewRecord` and `Regressed`), and the plugin decides what to play and rate-limits repeats.
+  Thresholds that decide *whether* something happened (`SLIP_SLACK`, `REGRESSION_DROP`) live
+  in `main.rs`, and the repeat gaps live in `audio.rs`. Add new progress sounds as `Milestone`
+  variants rather than new message types, so systems stay under Bevy's argument limit. All sound is a `Synth` asset (a custom
   `Decodable`) generated in code, one tiny asset per one-shot, plus an endless procedural music
   loop. `AudioSettings` holds mute, the music and effects volumes, and `unlocked`.
 - `web/index.html`: the page that loads the wasm build, focuses Bevy's canvas, and resumes the
@@ -94,7 +98,7 @@ Later ideas, each aimed at a different Bevy feature:
   cameras shown in UI buttons.
 - **Creature editor**: drag nodes and draw muscles with bevy_picking and observers, then evolve
   the design.
-- **Effects and feedback**: (landing thuds, metre bells and record fanfare are in) a custom Material2d shader tinting
+- **Effects and feedback**: (landing thuds, metre bells, record fanfare and the going-backwards sounds are in) a custom Material2d shader tinting
   muscles by tension, particles and screen shake on records, slow-motion via `Time<Virtual>`.
 - **Persistence**: unlocked levels and best scores, in files natively and `localStorage` on the
   web.

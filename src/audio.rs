@@ -1,8 +1,8 @@
 //! Sound: effects synthesized from what the playback does, a procedural music loop, and separate
 //! music and effects volumes. Nothing is loaded from files, so the web download doesn't grow.
 //!
-//! Gameplay code only writes messages (`Landed`, `MetrePassed`, `NewRecord`); this plugin
-//! decides what, if anything, to play.
+//! Gameplay code only writes messages (`Landed`, `Milestone`); this plugin decides what, if
+//! anything, to play.
 
 use bevy::audio::{AddAudioSource, ChannelCount, Source, Volume};
 use bevy::prelude::*;
@@ -14,8 +14,11 @@ const SAMPLE_RATE: u32 = 44_100;
 const MAX_VOICES: usize = 12;
 /// Most landing thuds started in one frame (the loudest win).
 const THUDS_PER_FRAME: usize = 2;
-/// Shortest gap between record fanfares, in seconds, so auto-run doesn't spam them.
+/// Shortest gaps between repeats, in seconds, so auto-run and rocking creatures don't spam them.
 const FANFARE_GAP: f32 = 1.5;
+const REGRESSION_GAP: f32 = 1.5;
+const SLIP_GAP: f32 = 0.8;
+const TROMBONE_GAP: f32 = 5.0;
 
 /// A node hit the ground. `speed` is its downward speed (units per step) just before impact.
 #[derive(Message)]
@@ -25,13 +28,21 @@ pub struct Landed {
     pub friction: f32,
 }
 
-/// The watched creature passed this metre post for the first time this run.
-#[derive(Message)]
-pub struct MetrePassed(pub i32);
-
-/// A generation beat the best distance so far.
-#[derive(Message)]
-pub struct NewRecord;
+/// Progress worth hearing, good or bad.
+#[derive(Message, Clone, Copy)]
+pub enum Milestone {
+    /// The watched creature passed this metre post for the first time this run. Negative posts
+    /// are behind the start.
+    Metre(i32),
+    /// The creature fell back behind the furthest post it had passed.
+    SlippedBack,
+    /// The run finished behind the start line.
+    EndedBehind,
+    /// A generation beat the best distance so far.
+    NewRecord,
+    /// A generation's best did clearly worse than the previous generation's.
+    Regressed,
+}
 
 #[derive(Resource)]
 pub struct AudioSettings {
@@ -59,8 +70,7 @@ impl Plugin for SoundPlugin {
     fn build(&self, app: &mut App) {
         app.add_audio_source::<Synth>()
             .add_message::<Landed>()
-            .add_message::<MetrePassed>()
-            .add_message::<NewRecord>()
+            .add_message::<Milestone>()
             .insert_resource(AudioSettings {
                 muted: false,
                 music: 0.5,
@@ -82,6 +92,9 @@ struct SfxState {
     /// For detuning; separate from the simulation's RNG so sound never affects evolution.
     rng: u32,
     last_fanfare: f32,
+    last_regression: f32,
+    last_slip: f32,
+    last_trombone: f32,
 }
 
 impl SfxState {
@@ -157,8 +170,7 @@ fn play_sfx(
     mut synths: ResMut<Assets<Synth>>,
     voices: Query<(), With<SfxVoice>>,
     mut landed: MessageReader<Landed>,
-    mut metres: MessageReader<MetrePassed>,
-    mut records: MessageReader<NewRecord>,
+    mut milestones: MessageReader<Milestone>,
 ) {
     let gain = settings.sfx_gain();
     let mut free = MAX_VOICES.saturating_sub(voices.iter().len());
@@ -177,14 +189,35 @@ fn play_sfx(
         ));
     };
 
-    // Milestones first, so a pile of thuds can't take their voices.
+    // Milestones first, so a pile of thuds can't take their voices. Only the latest metre post
+    // in a frame rings. The sad sounds are quieter: failure is most of what evolution does.
     let now = time.elapsed_secs();
-    if records.read().count() > 0 && now - state.last_fanfare > FANFARE_GAP {
-        state.last_fanfare = now;
-        play(Synth::Fanfare, 0.4, 1.0);
+    let mut metre = None;
+    for m in milestones.read() {
+        match *m {
+            Milestone::NewRecord if now - state.last_fanfare > FANFARE_GAP => {
+                state.last_fanfare = now;
+                play(Synth::Fanfare, 0.4, 1.0);
+            }
+            Milestone::Regressed if now - state.last_regression > REGRESSION_GAP => {
+                state.last_regression = now;
+                play(Synth::Deflate, 0.3, 1.0);
+            }
+            Milestone::EndedBehind if now - state.last_trombone > TROMBONE_GAP => {
+                state.last_trombone = now;
+                play(Synth::Trombone, 0.35, 1.0);
+            }
+            Milestone::SlippedBack if now - state.last_slip > SLIP_GAP => {
+                state.last_slip = now;
+                play(Synth::Slip, 0.3, 1.0);
+            }
+            Milestone::Metre(m) => metre = Some(m),
+            _ => {}
+        }
     }
-    if let Some(MetrePassed(m)) = metres.read().last() {
-        play(Synth::Ding { freq: metre_pitch(*m) }, 0.3, 1.0);
+    if let Some(m) = metre {
+        let volume = if m > 0 { 0.3 } else { 0.25 };
+        play(Synth::Ding { freq: metre_pitch(m) }, volume, 1.0);
     }
 
     let mut hits: Vec<&Landed> = landed.read().collect();
@@ -198,11 +231,18 @@ fn play_sfx(
     }
 }
 
-/// Each metre climbs a pentatonic scale, so a good run plays a little tune.
+/// Each metre forward climbs a major pentatonic scale, so a good run plays a little tune. Each
+/// metre backward descends a minor one from below it, so going the wrong way sounds glum.
 fn metre_pitch(m: i32) -> f32 {
-    const PENTATONIC: [i32; 5] = [0, 2, 4, 7, 9];
-    let m = m.max(1) - 1;
-    let note = (72 + PENTATONIC[(m % 5) as usize] + 12 * (m / 5)).min(100);
+    const MAJOR: [i32; 5] = [0, 2, 4, 7, 9];
+    const MINOR_DOWN: [i32; 5] = [0, -2, -5, -7, -9];
+    let note = if m > 0 {
+        let k = m - 1;
+        (72 + MAJOR[(k % 5) as usize] + 12 * (k / 5)).min(100)
+    } else {
+        let k = (-m).max(1) - 1;
+        (69 + MINOR_DOWN[(k % 5) as usize] - 12 * (k / 5)).max(40)
+    };
     midi_hz(note as f32)
 }
 
@@ -223,6 +263,12 @@ enum Synth {
     Ding { freq: f32 },
     /// A rising arpeggio.
     Fanfare,
+    /// A quick downward "bwomp".
+    Slip,
+    /// A soft, deflating "wah-wah".
+    Deflate,
+    /// The sad trombone: three falling notes and a long wobbly fourth.
+    Trombone,
     /// An endless, gentle loop of plucked arpeggios over a bass line.
     Music,
 }
@@ -234,6 +280,9 @@ impl Synth {
             Synth::Thud { .. } => Some(0.25),
             Synth::Ding { .. } => Some(1.4),
             Synth::Fanfare => Some(1.0),
+            Synth::Slip => Some(0.3),
+            Synth::Deflate => Some(0.9),
+            Synth::Trombone => Some(2.1),
             Synth::Music => None,
         }
     }
@@ -258,12 +307,18 @@ pub struct SynthDecoder {
     /// Samples played so far. The music runs for hours, so time is worked out from this in f64.
     n: u64,
     end: Option<u64>,
-    /// Running oscillator phase in cycles, for the thud's pitch sweep.
+    /// Running oscillator phase in cycles, for sounds whose pitch slides.
     phase: f32,
     noise: u32,
 }
 
 impl SynthDecoder {
+    /// Advance the oscillator at `freq` Hz and return its phase, in cycles.
+    fn advance(&mut self, freq: f32) -> f32 {
+        self.phase = (self.phase + freq / SAMPLE_RATE as f32).fract();
+        self.phase
+    }
+
     fn white(&mut self) -> f32 {
         self.noise ^= self.noise << 13;
         self.noise ^= self.noise >> 17;
@@ -275,6 +330,16 @@ impl SynthDecoder {
 /// A short attack, so notes don't click on.
 fn attack(t: f32) -> f32 {
     (t * 400.0).min(1.0)
+}
+
+/// Fade out over the last 30 ms before `end`, so notes don't click off.
+fn release(t: f32, end: f32) -> f32 {
+    ((end - t) * 33.0).clamp(0.0, 1.0)
+}
+
+/// A brassy tone at phase `p` (cycles): the first five harmonics, falling off as 1/n.
+fn brass(p: f32) -> f32 {
+    (1..=5).map(|n| (TAU * n as f32 * p).sin() / n as f32).sum::<f32>() / 2.3
 }
 
 /// A plucked note `t` seconds after it started.
@@ -295,9 +360,8 @@ impl Iterator for SynthDecoder {
         self.n += 1;
         let s = match self.synth {
             Synth::Thud { freq } => {
-                let f = freq * (1.0 + 1.5 * (-t * 40.0).exp());
-                self.phase = (self.phase + f / SAMPLE_RATE as f32).fract();
-                let body = (TAU * self.phase).sin() * (-t * 18.0).exp();
+                let p = self.advance(freq * (1.0 + 1.5 * (-t * 40.0).exp()));
+                let body = (TAU * p).sin() * (-t * 18.0).exp();
                 let click = self.white() * (-t * 250.0).exp() * 0.35;
                 attack(t) * body + click
             }
@@ -317,6 +381,28 @@ impl Iterator for SynthDecoder {
                     }
                 }
                 s * 0.5
+            }
+            Synth::Slip => {
+                let p = self.advance(170.0 + 380.0 * (-t * 10.0).exp());
+                attack(t) * release(t, 0.3) * (TAU * p).sin()
+            }
+            Synth::Deflate => {
+                // "wah" on one note, then a second that sags as it fades.
+                let (note, start, end) = if t < 0.3 { (64.0, 0.0, 0.3) } else { (62.0 - 5.0 * (t - 0.3), 0.3, 0.9) };
+                let p = self.advance(midi_hz(note));
+                let env = attack(t - start) * release(t, end) * (1.0 - 0.5 * ((t - start) / (end - start)));
+                0.6 * env * brass(p)
+            }
+            Synth::Trombone => {
+                const NOTES: [(f32, f32, f32); 4] = [(62.0, 0.0, 0.35), (61.0, 0.4, 0.75), (60.0, 0.8, 1.15), (59.0, 1.2, 2.1)];
+                match NOTES.iter().find(|(_, start, end)| (*start..*end).contains(&t)) {
+                    Some(&(note, start, end)) => {
+                        let wobble = if note == 59.0 { 0.35 * (TAU * 5.0 * (t - start)).sin() } else { 0.0 };
+                        let p = self.advance(midi_hz(note + wobble));
+                        0.7 * attack((t - start) * 0.15) * release(t, end) * brass(p)
+                    }
+                    None => 0.0,
+                }
             }
             Synth::Music => music(t_long),
         };
@@ -380,7 +466,16 @@ mod tests {
 
     #[test]
     fn synths_stay_in_range_and_one_shots_end() {
-        let sounds = [Synth::Thud { freq: 70.0 }, Synth::Thud { freq: 120.0 }, Synth::Ding { freq: metre_pitch(30) }, Synth::Fanfare];
+        let sounds = [
+            Synth::Thud { freq: 70.0 },
+            Synth::Thud { freq: 120.0 },
+            Synth::Ding { freq: metre_pitch(30) },
+            Synth::Ding { freq: metre_pitch(-30) },
+            Synth::Fanfare,
+            Synth::Slip,
+            Synth::Deflate,
+            Synth::Trombone,
+        ];
         for synth in sounds {
             let samples: Vec<f32> = synth.decoder().collect();
             assert_eq!(samples.len(), (synth.length().unwrap() * SAMPLE_RATE as f32) as usize);

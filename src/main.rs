@@ -2,7 +2,7 @@
 
 mod audio;
 
-use audio::{AudioSettings, Landed, MetrePassed, NewRecord, SoundPlugin};
+use audio::{AudioSettings, Landed, Milestone, SoundPlugin};
 use bevy::input::mouse::AccumulatedMouseScroll;
 use bevy::prelude::*;
 use springy_evolution::sim::{self, Config, Creature, GenStats, Population, Sim};
@@ -20,6 +20,11 @@ const HOLD_SECS: f32 = 2.0;
 const LANDING_SOUND_MAX_SPEED: u32 = 4;
 /// Downward speed (units per step) a node needs when it lands to make a sound.
 const LANDING_SOUND_MIN_IMPACT: f32 = 0.012;
+/// How far (m) behind its furthest post a creature must fall before it counts as slipping back,
+/// so rocking on the line doesn't repeat the sound.
+const SLIP_SLACK: f32 = 0.1;
+/// A generation's best must fall this fraction below the previous best to count as a regression.
+const REGRESSION_DROP: f32 = 0.05;
 
 fn to_world(x: f32, y: f32) -> Vec2 {
     Vec2::new(x * S, -y * S)
@@ -204,13 +209,25 @@ struct Playback {
     hold: f32,
     /// Simulation steps owed but not yet run, so playback follows real time at any frame rate.
     owed: f32,
-    /// Furthest metre post passed so far this run.
+    /// Furthest metre post passed so far this run, going forwards and backwards (0 or less).
     metre: i32,
+    behind: i32,
+    /// Whether the creature has fallen back behind `metre` since passing it.
+    slipped: bool,
 }
 
 impl Playback {
     fn new(source: &Creature, label: String) -> Self {
-        Self { sim: Sim::new(source), source: source.clone(), label, hold: 0.0, owed: 0.0, metre: 0 }
+        Self {
+            sim: Sim::new(source),
+            source: source.clone(),
+            label,
+            hold: 0.0,
+            owed: 0.0,
+            metre: 0,
+            behind: 0,
+            slipped: false,
+        }
     }
 }
 
@@ -487,14 +504,19 @@ fn poll_worker(
     mut evo: ResMut<Evo>,
     view: Res<View>,
     mut playback: ResMut<Playback>,
-    mut records: MessageWriter<NewRecord>,
+    mut milestones: MessageWriter<Milestone>,
 ) {
     let finished = evo.worker.take().and_then(|w| w.poll().map_err(|w| evo.worker = Some(w)).ok());
     if let Some(pop) = finished {
         if let Some(stats) = pop.latest() {
-            let record = evo.history.iter().map(|s| s.percentiles[0]).fold(f32::NEG_INFINITY, f32::max);
-            if !evo.history.is_empty() && stats.percentiles[0] > record + 1e-3 {
-                records.write(NewRecord);
+            let best = stats.percentiles[0];
+            if let Some(prev) = evo.history.last().map(|s| s.percentiles[0]) {
+                let record = evo.history.iter().map(|s| s.percentiles[0]).fold(f32::NEG_INFINITY, f32::max);
+                if best > record + 1e-3 {
+                    milestones.write(Milestone::NewRecord);
+                } else if best < prev - (prev.abs() * REGRESSION_DROP).max(0.01) {
+                    milestones.write(Milestone::Regressed);
+                }
             }
             evo.history.push(stats.clone());
         }
@@ -524,7 +546,7 @@ fn step_playback(
     time: Res<Time>,
     mut pb: ResMut<Playback>,
     mut landed: MessageWriter<Landed>,
-    mut metres: MessageWriter<MetrePassed>,
+    mut milestones: MessageWriter<Milestone>,
 ) {
     let steps = evo.cfg.sim_steps;
     let dt = time.delta_secs();
@@ -550,12 +572,32 @@ fn step_playback(
                 }
             }
         }
-        // Ding for each new metre post, but not in "instant" playback.
-        let metre = pb.sim.distance_m().floor() as i32;
-        if metre > pb.metre {
-            pb.metre = metre;
-            if view.speed_idx < SPEEDS.len() - 1 {
-                metres.write(MetrePassed(metre));
+        // Progress sounds, though not in "instant" playback.
+        let audible = view.speed_idx < SPEEDS.len() - 1;
+        let mut say = |m: Milestone| {
+            if audible {
+                milestones.write(m);
+            }
+        };
+        let d = pb.sim.distance_m();
+        if d.is_finite() {
+            if d.floor() as i32 > pb.metre {
+                pb.metre = d.floor() as i32;
+                say(Milestone::Metre(pb.metre));
+            } else if (d.ceil() as i32) < pb.behind {
+                pb.behind = d.ceil() as i32;
+                say(Milestone::Metre(pb.behind));
+            }
+            if pb.metre >= 1 {
+                if !pb.slipped && d < pb.metre as f32 - SLIP_SLACK {
+                    pb.slipped = true;
+                    say(Milestone::SlippedBack);
+                } else if d >= pb.metre as f32 {
+                    pb.slipped = false;
+                }
+            }
+            if pb.sim.timer >= steps && d < 0.0 {
+                say(Milestone::EndedBehind);
             }
         }
     } else {
