@@ -794,6 +794,8 @@ pub struct Population {
     pub history: Vec<GenStats>,
     rng: Rng,
     next_id: u64,
+    /// How many creatures of the current generation `evaluate_batch` has tested so far.
+    evaluated: usize,
 }
 
 impl Population {
@@ -812,10 +814,31 @@ impl Population {
             generation: 0,
             history: Vec::new(),
             rng,
+            evaluated: 0,
         }
     }
 
+    /// Test the next `n` untested creatures; returns true once the whole generation is tested.
+    /// Lets a single-threaded caller (the web build) spread a generation across frames.
+    pub fn evaluate_batch(&mut self, n: usize) -> bool {
+        let end = (self.evaluated + n).min(self.creatures.len());
+        let cfg = &self.cfg;
+        for c in &mut self.creatures[self.evaluated..end] {
+            c.fitness = evaluate(c, cfg);
+        }
+        self.evaluated = end;
+        end == self.creatures.len()
+    }
+
+    /// wasm32-unknown-unknown has no threads, so test everything on this one.
+    #[cfg(target_arch = "wasm32")]
+    fn evaluate_all(&mut self) {
+        let remaining = self.creatures.len() - self.evaluated;
+        self.evaluate_batch(remaining);
+    }
+
     /// Evaluate on all cores. Each creature's run is independent, so results are deterministic.
+    #[cfg(not(target_arch = "wasm32"))]
     fn evaluate_all(&mut self) {
         let cfg = &self.cfg;
         let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
@@ -834,6 +857,12 @@ impl Population {
     /// One full generation: test → sort → kill → reproduce.
     pub fn step(&mut self) {
         self.evaluate_all();
+        self.finish_generation();
+    }
+
+    /// Everything after testing: sort → record stats → kill → reproduce.
+    pub fn finish_generation(&mut self) {
+        self.evaluated = 0;
         // Best first.
         self.creatures.sort_by(|a, b| b.fitness.total_cmp(&a.fitness));
         let pop = self.creatures.len();

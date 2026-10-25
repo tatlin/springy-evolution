@@ -3,7 +3,6 @@
 use bevy::input::mouse::AccumulatedMouseScroll;
 use bevy::prelude::*;
 use springy_evolution::sim::{Config, Creature, GenStats, Population, Sim};
-use std::thread::JoinHandle;
 
 /// Pixels per simulation unit (1 unit = 20 cm), same as the original's camzoom of 0.01.
 const S: f32 = 100.0;
@@ -52,9 +51,9 @@ struct Evo {
     fixed_topology: bool,
     /// `--min-connections` override for `Config::min_connections`.
     min_connections: Option<usize>,
-    /// `None` while a generation is being computed on the worker thread.
+    /// `None` while a generation is being computed by `worker`.
     pop: Option<Population>,
-    worker: Option<JoinHandle<Population>>,
+    worker: Option<Worker>,
     history: Vec<GenStats>,
     /// A creature from the untested first generation, to watch before anything is evaluated.
     preview: Creature,
@@ -103,13 +102,70 @@ impl Evo {
     }
 
     fn start_generation(&mut self) {
-        if let Some(mut pop) = self.pop.take() {
-            self.worker = Some(std::thread::spawn(move || {
-                pop.step();
-                pop
-            }));
+        if let Some(pop) = self.pop.take() {
+            self.worker = Some(Worker::start(pop));
         }
     }
+}
+
+/// Computes one generation without stalling the window: on a background thread natively, and
+/// a few milliseconds per frame on the web, where wasm has no threads.
+#[cfg(not(target_arch = "wasm32"))]
+struct Worker(std::thread::JoinHandle<Population>);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Worker {
+    fn start(mut pop: Population) -> Self {
+        Self(std::thread::spawn(move || {
+            pop.step();
+            pop
+        }))
+    }
+
+    /// The finished population, or the worker back if it is still running.
+    fn poll(self) -> Result<Population, Self> {
+        if !self.0.is_finished() {
+            return Err(self);
+        }
+        Ok(self.0.join().expect("generation thread panicked"))
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+struct Worker(Population);
+
+#[cfg(target_arch = "wasm32")]
+impl Worker {
+    /// Per-frame time budget for testing creatures, leaving room to render at 60 fps.
+    const BUDGET: std::time::Duration = std::time::Duration::from_millis(10);
+
+    fn start(pop: Population) -> Self {
+        Self(pop)
+    }
+
+    fn poll(mut self) -> Result<Population, Self> {
+        let start = bevy::platform::time::Instant::now();
+        while start.elapsed() < Self::BUDGET {
+            if self.0.evaluate_batch(10) {
+                self.0.finish_generation();
+                return Ok(self.0);
+            }
+        }
+        Err(self)
+    }
+}
+
+/// A fresh seed when none is given on the command line.
+#[cfg(not(target_arch = "wasm32"))]
+fn random_seed() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64
+}
+
+/// The browser has no `SystemTime`, so ask it for random bits instead.
+#[cfg(target_arch = "wasm32")]
+fn random_seed() -> u64 {
+    let half = || (js_sys::Math::random() * u32::MAX as f64) as u64;
+    half() << 32 | half()
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -170,10 +226,7 @@ fn main() {
     let arg = |name: &str| parse_arg::<u64>(&args, name);
     let preset =
         if args.iter().any(|a| a == "--cary") { Preset::CaryHuang } else { Preset::Evolution3Web };
-    let seed = arg("--seed").unwrap_or_else(|| {
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-            as u64
-    });
+    let seed = arg("--seed").unwrap_or_else(random_seed);
     let population: usize = parse_arg(&args, "--pop").unwrap_or(1000);
 
     let max_muscle_length = parse_arg(&args, "--max-len");
@@ -189,6 +242,8 @@ fn main() {
             primary_window: Some(Window {
                 title: "Springy Evolution — Rust + Bevy".into(),
                 resolution: (1280u32, 720u32).into(),
+                // On the web, fill the page instead of a fixed 1280×720 canvas.
+                fit_canvas_to_parent: true,
                 ..default()
             }),
             ..default()
@@ -411,8 +466,8 @@ fn input(
 }
 
 fn poll_worker(mut evo: ResMut<Evo>, view: Res<View>, mut playback: ResMut<Playback>) {
-    if evo.worker.as_ref().is_some_and(|h| h.is_finished()) {
-        let pop = evo.worker.take().unwrap().join().expect("generation thread panicked");
+    let finished = evo.worker.take().and_then(|w| w.poll().map_err(|w| evo.worker = Some(w)).ok());
+    if let Some(pop) = finished {
         if let Some(stats) = pop.latest() {
             evo.history.push(stats.clone());
         }

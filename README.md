@@ -18,6 +18,20 @@ the original's rank-pairing lottery, then each survivor is cloned once and has o
     cargo run --release -- --fixed-topology  # never add/remove nodes or muscles
     cargo run --release -- --min-connections 0  # sparse regrowth, as in evolution3WEB
 
+## Web
+
+Play it in the browser at <https://tatlin.github.io/springy-evolution/> (click the page first so
+it gets keyboard focus). Every push to `master` builds it for `wasm32-unknown-unknown` and deploys
+it with `.github/workflows/pages.yml`. wasm has no threads, so the web build tests creatures on the
+main thread, about 10 ms per frame, instead of on a worker. To build it locally (the
+`wasm-bindgen` CLI must match the version in `Cargo.lock`):
+
+    rustup target add wasm32-unknown-unknown
+    cargo build --profile web --target wasm32-unknown-unknown
+    wasm-bindgen --target web --no-typescript --out-dir dist \
+      target/wasm32-unknown-unknown/web/springy-evolution.wasm
+    cp web/index.html dist/ && python3 -m http.server -d dist
+
 ## Controls
 
 | Key | Action |

@@ -4995,6 +4995,7 @@ name = "springy-evolution"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "js-sys",
 ]
 
 [[package]]
