@@ -1,14 +1,25 @@
 //! Bevy front end: watch creatures run, breed generations in the background, plot progress.
 
+mod audio;
+
+use audio::{AudioSettings, Landed, MetrePassed, NewRecord, SoundPlugin};
 use bevy::input::mouse::AccumulatedMouseScroll;
 use bevy::prelude::*;
-use springy_evolution::sim::{Config, Creature, GenStats, Population, Sim};
+use springy_evolution::sim::{self, Config, Creature, GenStats, Population, Sim};
 
 /// Pixels per simulation unit (1 unit = 20 cm), same as the original's camzoom of 0.01.
 const S: f32 = 100.0;
 /// How far above the camera centre the ground sits, in pixels (original: 80% down the screen).
 const GROUND_OFFSET: f32 = 216.0;
 const SPEEDS: [u32; 8] = [1, 2, 4, 8, 16, 32, 64, 900];
+/// Simulation steps per second at 1× (the original ran one step per frame at 60 fps).
+const STEP_RATE: f32 = 60.0;
+/// Seconds to hold the final pose before a replay restarts.
+const HOLD_SECS: f32 = 2.0;
+/// Fastest playback that still makes landing sounds; above it they'd be a wall of noise.
+const LANDING_SOUND_MAX_SPEED: u32 = 4;
+/// Downward speed (units per step) a node needs when it lands to make a sound.
+const LANDING_SOUND_MIN_IMPACT: f32 = 0.012;
 
 fn to_world(x: f32, y: f32) -> Vec2 {
     Vec2::new(x * S, -y * S)
@@ -189,12 +200,17 @@ struct Playback {
     source: Creature,
     sim: Sim,
     label: String,
-    hold: u32,
+    /// Seconds spent holding the final pose.
+    hold: f32,
+    /// Simulation steps owed but not yet run, so playback follows real time at any frame rate.
+    owed: f32,
+    /// Furthest metre post passed so far this run.
+    metre: i32,
 }
 
 impl Playback {
     fn new(source: &Creature, label: String) -> Self {
-        Self { sim: Sim::new(source), source: source.clone(), label, hold: 0 }
+        Self { sim: Sim::new(source), source: source.clone(), label, hold: 0.0, owed: 0.0, metre: 0 }
     }
 }
 
@@ -248,6 +264,7 @@ fn main() {
             }),
             ..default()
         }))
+        .add_plugins(SoundPlugin)
         .insert_resource(ClearColor(Color::srgb_u8(120, 200, 255)))
         .insert_resource(evo)
         .insert_resource(playback)
@@ -375,6 +392,7 @@ fn watch_target(evo: &Evo, view: &View) -> Option<(Creature, String)> {
 fn input(
     keys: Res<ButtonInput<KeyCode>>,
     scroll: Res<AccumulatedMouseScroll>,
+    time: Res<Time>,
     mut evo: ResMut<Evo>,
     mut view: ResMut<View>,
     mut playback: ResMut<Playback>,
@@ -425,10 +443,10 @@ fn input(
     // Zoom (wheel or -/=).
     let mut z = 0.0;
     if keys.pressed(KeyCode::Minus) {
-        z += 0.02;
+        z += 1.2 * time.delta_secs();
     }
     if keys.pressed(KeyCode::Equal) {
-        z -= 0.02;
+        z -= 1.2 * time.delta_secs();
     }
     z -= scroll.delta.y.clamp(-5.0, 5.0) * 0.05;
     view.zoom = (view.zoom * (1.0 + z)).clamp(0.3, 8.0);
@@ -465,16 +483,25 @@ fn input(
     }
 }
 
-fn poll_worker(mut evo: ResMut<Evo>, view: Res<View>, mut playback: ResMut<Playback>) {
+fn poll_worker(
+    mut evo: ResMut<Evo>,
+    view: Res<View>,
+    mut playback: ResMut<Playback>,
+    mut records: MessageWriter<NewRecord>,
+) {
     let finished = evo.worker.take().and_then(|w| w.poll().map_err(|w| evo.worker = Some(w)).ok());
     if let Some(pop) = finished {
         if let Some(stats) = pop.latest() {
+            let record = evo.history.iter().map(|s| s.percentiles[0]).fold(f32::NEG_INFINITY, f32::max);
+            if !evo.history.is_empty() && stats.percentiles[0] > record + 1e-3 {
+                records.write(NewRecord);
+            }
             evo.history.push(stats.clone());
         }
         evo.pop = Some(pop);
         // When following the latest generation, start watching the new champion — but don't
         // interrupt a replay in progress while auto-running unless it has finished.
-        if view.selected_gen.is_none() && (!evo.auto || playback.hold > 0 || evo.history.len() == 1)
+        if view.selected_gen.is_none() && (!evo.auto || playback.hold > 0.0 || evo.history.len() == 1)
         {
             if let Some((c, label)) = watch_target(&evo, &view) {
                 *playback = Playback::new(&c, label);
@@ -487,18 +514,53 @@ fn poll_worker(mut evo: ResMut<Evo>, view: Res<View>, mut playback: ResMut<Playb
     }
 }
 
-fn step_playback(evo: Res<Evo>, view: Res<View>, mut pb: ResMut<Playback>) {
+fn on_ground(n: &sim::Node) -> bool {
+    n.y + n.m / 2.0 >= -1e-4
+}
+
+fn step_playback(
+    evo: Res<Evo>,
+    view: Res<View>,
+    time: Res<Time>,
+    mut pb: ResMut<Playback>,
+    mut landed: MessageWriter<Landed>,
+    mut metres: MessageWriter<MetrePassed>,
+) {
     let steps = evo.cfg.sim_steps;
+    let dt = time.delta_secs();
     if pb.sim.timer < steps {
-        for _ in 0..SPEEDS[view.speed_idx] {
-            if pb.sim.timer >= steps {
-                break;
+        let speed = SPEEDS[view.speed_idx] as f32;
+        // Catch up at most a tenth of a second after a stall (or a hidden browser tab).
+        pb.owed = (pb.owed + dt * STEP_RATE * speed).min(speed * STEP_RATE * 0.1);
+        if view.speed_idx == SPEEDS.len() - 1 {
+            pb.owed = steps as f32; // "instant"
+        }
+        let thuds = SPEEDS[view.speed_idx] <= LANDING_SOUND_MAX_SPEED;
+        while pb.owed >= 1.0 && pb.sim.timer < steps {
+            pb.owed -= 1.0;
+            if !thuds {
+                pb.sim.step(&evo.cfg);
+                continue;
             }
+            let before: Vec<(bool, f32)> = pb.sim.nodes.iter().map(|n| (on_ground(n), n.vy)).collect();
             pb.sim.step(&evo.cfg);
+            for (n, (was_down, vy)) in pb.sim.nodes.iter().zip(before) {
+                if !was_down && on_ground(n) && vy > LANDING_SOUND_MIN_IMPACT {
+                    landed.write(Landed { speed: vy, friction: n.f });
+                }
+            }
+        }
+        // Ding for each new metre post, but not in "instant" playback.
+        let metre = pb.sim.distance_m().floor() as i32;
+        if metre > pb.metre {
+            pb.metre = metre;
+            if view.speed_idx < SPEEDS.len() - 1 {
+                metres.write(MetrePassed(metre));
+            }
         }
     } else {
-        pb.hold += 1;
-        if pb.hold > 120 {
+        pb.hold += dt;
+        if pb.hold > HOLD_SECS {
             *pb = Playback::new(&pb.source.clone(), pb.label.clone());
         }
     }
@@ -723,7 +785,13 @@ fn draw_graph(evo: Res<Evo>, view: Res<View>, cam: Query<&Transform, With<Camera
     g.line_2d(pt(sel, lo), pt(sel, hi), Color::srgba(0.0, 0.6, 0.0, 0.6));
 }
 
-fn update_hud(evo: Res<Evo>, view: Res<View>, pb: Res<Playback>, mut hud: Query<&mut Text, With<Hud>>) {
+fn update_hud(
+    evo: Res<Evo>,
+    view: Res<View>,
+    pb: Res<Playback>,
+    sound: Res<AudioSettings>,
+    mut hud: Query<&mut Text, With<Hud>>,
+) {
     let Ok(mut text) = hud.single_mut() else { return };
     let mut s = format!("{}\n", evo.preset.name());
     match evo.history.last() {
@@ -749,7 +817,14 @@ fn update_hud(evo: Res<Evo>, view: Res<View>, pb: Res<Playback>, mut hud: Query<
         pb.sim.timer as f32 / 60.0,
         pb.label
     );
+    let pct = |v: f32| (v * 100.0).round() as u32;
+    s += &match (sound.unlocked, sound.muted) {
+        (false, _) => "Sound: press any key to start\n".to_string(),
+        (true, true) => "Sound: muted\n".to_string(),
+        (true, false) => format!("Sound: music {}%   effects {}%\n", pct(sound.music), pct(sound.sfx)),
+    };
     s += "[Space] next gen   [A] auto   [1/2/3] best/median/worst   [←/→/End] browse gens\n\
-          [↑/↓] speed   [Enter] replay   [wheel or -/=] zoom   [P] switch preset   [R] restart";
+          [↑/↓] speed   [Enter] replay   [wheel or -/=] zoom   [P] switch preset   [R] restart\n\
+          [M] mute   [,/.] music volume   [[/]] effects volume";
     text.0 = s;
 }

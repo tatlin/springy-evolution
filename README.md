@@ -45,6 +45,18 @@ main thread, about 10 ms per frame, instead of on a worker. To build it locally 
 | Mouse wheel, − / = | zoom |
 | P | switch preset and restart |
 | R | restart with a new seed |
+| M | mute / unmute |
+| , / . | music volume down / up |
+| [ / ] | effects volume down / up |
+
+## Sound
+
+Everything you hear is synthesized in code (`src/audio.rs`), so the web build downloads no
+audio files. Nodes thud when they land, louder the harder they hit and deeper for grippy black
+feet. Each new metre post rings a bell that climbs a pentatonic scale, and a generation that beats
+the best distance so far plays a short fanfare. Landing sounds stop above 4× playback, and the
+bells stop in instant playback. A gentle procedural loop plays underneath as music. In the
+browser, sound starts after your first key press or click.
 
 ## Layout
 
@@ -53,6 +65,8 @@ main thread, about 10 ms per frame, instead of on a worker. To build it locally 
   `modified()`/`modifyNode()`/`modifyMuscle()`, and the kill/reproduce stages. Deterministic per
   seed; evaluation is spread across all cores with `std::thread::scope`.
 - `src/main.rs` — Bevy front end. Generations run on a worker thread so the window never stalls.
+  Playback follows real time at any frame rate (60 sim steps per second at 1×).
+- `src/audio.rs` — synthesized sound effects, procedural music, and the volume controls.
 
 ## The two presets
 

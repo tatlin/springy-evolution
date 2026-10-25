@@ -33,6 +33,27 @@
   </head>
   <body>
     <div id="status">Loading Springy Evolution…</div>
+    <script>
+      // Browsers start audio suspended until a user gesture, and Bevy's audio backend only asks
+      // to resume once, at startup. Keep every AudioContext it makes and resume them on input.
+      // This must run before the bindings module loads, because it captures AudioContext then.
+      const audioContexts = [];
+      const NativeAudioContext = window.AudioContext;
+      if (NativeAudioContext) {
+        window.AudioContext = class extends NativeAudioContext {
+          constructor(...args) {
+            super(...args);
+            audioContexts.push(this);
+          }
+        };
+      }
+      const resumeAudio = () => {
+        for (const ctx of audioContexts) if (ctx.state !== "running") ctx.resume();
+      };
+      for (const type of ["keydown", "pointerdown", "touchend"]) {
+        addEventListener(type, resumeAudio, { capture: true });
+      }
+    </script>
     <script type="module">
       import init from "./springy-evolution.js";
 

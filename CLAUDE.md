@@ -17,8 +17,15 @@ browser at <https://tatlin.github.io/springy-evolution/>.
   `evaluate_batch` + `finish_generation` split a generation so it can be spread across frames.
 - `src/main.rs`: the Bevy front end. It plays back one creature (`Playback`), runs generations
   via `Worker`, draws with a pooled set of node and muscle entities, and follows the creature with
-  a dead-zone, critically damped camera (`CameraRig`, `smooth_damp`).
-- `web/index.html`: the page that loads the wasm build and focuses Bevy's canvas.
+  a dead-zone, critically damped camera (`CameraRig`, `smooth_damp`). `step_playback` owes sim
+  steps from `Time` (`STEP_RATE` = 60/s at 1×), so playback speed doesn't depend on frame rate,
+  and it writes the audio messages as it steps.
+- `src/audio.rs`: `SoundPlugin`. Gameplay writes `Landed`, `MetrePassed` and `NewRecord`
+  messages, and the plugin decides what to play. All sound is a `Synth` asset (a custom
+  `Decodable`) generated in code, one tiny asset per one-shot, plus an endless procedural music
+  loop. `AudioSettings` holds mute, the music and effects volumes, and `unlocked`.
+- `web/index.html`: the page that loads the wasm build, focuses Bevy's canvas, and resumes the
+  AudioContext on the first input.
 - `.github/workflows/pages.yml`: builds wasm and deploys to GitHub Pages on every push to `main`.
 
 ## Commands
@@ -56,6 +63,18 @@ by the workflow.
   length, so without `max_muscle_length` creatures sprawl to 100+ units. Fitness tracks size
   closely there: a longer `--max-len` gives better scores but bigger creatures.
 - A black node is maximum ground friction, not a bug. Evolution uses one as an anchor foot.
+- Browsers create the AudioContext suspended, and cpal only calls `resume()` once, at startup, so
+  without help the web build is silent forever. `web/index.html` wraps `window.AudioContext` in a
+  classic `<script>` and resumes every context on keydown/pointerdown/touchend. It must stay a
+  classic script before the module, because the wasm-bindgen JS captures `AudioContext` when the
+  module is evaluated. Rust drops effects until `AudioSettings::unlocked` so they don't pile up
+  while the context is suspended.
+- `GlobalVolume` and `PlaybackSettings` don't affect audio that's already playing. Change the music
+  volume through its `AudioSink`, as `apply_music_volume` does.
+- Browser automation sends punctuation keys without `KeyboardEvent.code`, so winit ignores them.
+  To test `,` `.` `[` `]` in the web build, dispatch real `KeyboardEvent`s on the canvas.
+  To check that sound is playing, wrap `AudioBuffer.prototype.copyToChannel` and look at the
+  sample peaks.
 - When testing in an embedded or hidden browser, frame-rate numbers are throttled to about 1 Hz.
   Check `longtask` entries instead of FPS to tell whether the page itself is busy.
 
@@ -75,7 +94,7 @@ Later ideas, each aimed at a different Bevy feature:
   cameras shown in UI buttons.
 - **Creature editor**: drag nodes and draw muscles with bevy_picking and observers, then evolve
   the design.
-- **Effects and feedback**: bevy_audio clicks when nodes land, a custom Material2d shader tinting
+- **Effects and feedback**: (landing thuds, metre bells and record fanfare are in) a custom Material2d shader tinting
   muscles by tension, particles and screen shake on records, slow-motion via `Time<Virtual>`.
 - **Persistence**: unlocked levels and best scores, in files natively and `localStorage` on the
   web.
