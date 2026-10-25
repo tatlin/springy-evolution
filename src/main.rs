@@ -50,6 +50,8 @@ struct Evo {
     max_muscle_length: Option<f32>,
     /// `--fixed-topology`: never add or remove nodes and muscles.
     fixed_topology: bool,
+    /// `--min-connections` override for `Config::min_connections`.
+    min_connections: Option<usize>,
     /// `None` while a generation is being computed on the worker thread.
     pop: Option<Population>,
     worker: Option<JoinHandle<Population>>,
@@ -67,10 +69,14 @@ impl Evo {
         population_size: usize,
         max_muscle_length: Option<f32>,
         fixed_topology: bool,
+        min_connections: Option<usize>,
     ) -> Self {
         let mut cfg = preset.config();
         cfg.population = population_size.max(2);
         cfg.mutate_topology = !fixed_topology;
+        if let Some(n) = min_connections {
+            cfg.min_connections = n;
+        }
         if let Some(len) = max_muscle_length {
             cfg.max_muscle_length = len.max(0.5);
         }
@@ -83,6 +89,7 @@ impl Evo {
             population_size,
             max_muscle_length,
             fixed_topology,
+            min_connections,
             pop: Some(pop),
             worker: None,
             history: Vec::new(),
@@ -171,8 +178,10 @@ fn main() {
 
     let max_muscle_length = parse_arg(&args, "--max-len");
     let fixed_topology = args.iter().any(|a| a == "--fixed-topology");
+    let min_connections = parse_arg(&args, "--min-connections");
 
-    let evo = Evo::new(preset, seed, population, max_muscle_length, fixed_topology);
+    let evo =
+        Evo::new(preset, seed, population, max_muscle_length, fixed_topology, min_connections);
     let playback = Playback::new(&evo.preview, "Generation 1, creature #1 (untested)".into());
 
     App::new()
@@ -188,6 +197,7 @@ fn main() {
         .insert_resource(evo)
         .insert_resource(playback)
         .insert_resource(View { selected_gen: None, which: Which::Best, speed_idx: 0, zoom: 1.0 })
+        .insert_resource(CameraRig { target_zoom: 1.0, last_view_zoom: 1.0, ..default() })
         .add_systems(Startup, (setup, spawn_obstacles))
         .add_systems(
             Update,
@@ -385,6 +395,7 @@ fn input(
             evo.population_size,
             evo.max_muscle_length,
             evo.fixed_topology,
+            evo.min_connections,
         );
         view.selected_gen = None;
         *playback = Playback::new(&evo.preview, "Generation 1, creature #1 (untested)".into());
@@ -526,45 +537,92 @@ fn creature_bounds(pb: &Playback) -> Option<Rect> {
         .reduce(|a, b| a.union(b))
 }
 
-/// Smallest camera scale that keeps `b` on screen with the ground in its usual place, leaving
-/// room above it for the distance readout.
-fn zoom_to_fit(b: Rect, window: &Window) -> f32 {
+/// Fraction of the half-screen the creature can wander from the camera centre before the
+/// camera starts to follow. Keeps the view still while a creature rocks in place.
+const DEAD_ZONE: f32 = 0.2;
+/// Zoom back in only once the creature fits at this fraction of the current zoom, so the view
+/// doesn't pump in and out as limbs extend and contract.
+const ZOOM_IN_SLACK: f32 = 0.7;
+
+/// Smallest camera scale that keeps everything within `reach` of `focus_x` on screen, plus the
+/// dead zone, with the ground in its usual place and room above for the distance readout.
+fn zoom_to_fit(b: Rect, reach: f32, window: &Window) -> f32 {
     const MARGIN: f32 = 0.5 * S;
     const READOUT_ROOM: f32 = 2.0 * S;
-    let fit_w = (b.width() + 2.0 * MARGIN) / window.width();
+    let fit_w = (reach + MARGIN) / ((1.0 - DEAD_ZONE) * window.width() / 2.0);
     let fit_h = b.max.y / (window.height() / 2.0 + GROUND_OFFSET - READOUT_ROOM);
     fit_w.max(fit_h)
+}
+
+/// Critically damped spring toward `target` (Unity's SmoothDamp): no overshoot, no jitter.
+fn smooth_damp(current: f32, target: f32, vel: &mut f32, smooth_time: f32, dt: f32) -> f32 {
+    let omega = 2.0 / smooth_time.max(1e-4);
+    let x = omega * dt;
+    let decay = 1.0 / (1.0 + x + 0.48 * x * x + 0.235 * x * x * x);
+    let change = current - target;
+    let temp = (*vel + omega * change) * dt;
+    *vel = (*vel - omega * temp) * decay;
+    target + (change + temp) * decay
+}
+
+/// Camera follow state that persists between frames.
+#[derive(Resource, Default)]
+struct CameraRig {
+    /// Where the camera is trying to centre; only moves when the creature leaves the dead zone.
+    focus_x: f32,
+    vel_x: f32,
+    target_zoom: f32,
+    zoom_vel: f32,
+    last_view_zoom: f32,
 }
 
 fn follow_camera(
     pb: Res<Playback>,
     view: Res<View>,
     time: Res<Time>,
+    mut rig: ResMut<CameraRig>,
     window: Query<&Window, With<bevy::window::PrimaryWindow>>,
     mut cam: Query<&mut Transform, (With<Camera2d>, Without<DistanceLabel>, Without<DistanceArrow>)>,
     mut label: Query<(&mut Transform, &mut Text2d), (With<DistanceLabel>, Without<DistanceArrow>)>,
     mut arrow: Query<&mut Transform, (With<DistanceArrow>, Without<DistanceLabel>)>,
 ) {
-    let cx = pb.sim.center_x();
+    let cx = pb.sim.center_x() * S;
     let Some(bounds) = creature_bounds(&pb).filter(|_| cx.is_finite()) else { return };
-    // Evolved creatures can sprawl far beyond one screen, so zoom out to frame the whole body.
-    let zoom = window.single().map_or(view.zoom, |w| view.zoom.max(zoom_to_fit(bounds, w)));
-    let t = 1.0 - (-8.0 * time.delta_secs()).exp();
+    let Ok(window) = window.single() else { return };
     let Ok(mut tf) = cam.single_mut() else { return };
-    let target = Vec2::new(bounds.center().x, GROUND_OFFSET * zoom);
-    let p = tf.translation.truncate().lerp(target, t);
-    tf.translation = p.extend(tf.translation.z);
-    tf.scale = Vec3::splat(tf.scale.x + (zoom - tf.scale.x) * t);
+    let dt = time.delta_secs();
+
+    // Zoom: out promptly when the creature doesn't fit, back in slowly and only with slack,
+    // and straight away when the user changes the zoom themselves.
+    let reach = (bounds.max.x - cx).max(cx - bounds.min.x);
+    let wanted = view.zoom.max(zoom_to_fit(bounds, reach, window));
+    let user_zoomed = view.zoom != rig.last_view_zoom;
+    if user_zoomed || wanted > rig.target_zoom || wanted < rig.target_zoom * ZOOM_IN_SLACK {
+        rig.target_zoom = wanted;
+    }
+    rig.last_view_zoom = view.zoom;
+    let zoom_time = if rig.target_zoom > tf.scale.x { 0.3 } else { 1.2 };
+    let target_zoom = rig.target_zoom;
+    let zoom = smooth_damp(tf.scale.x, target_zoom, &mut rig.zoom_vel, zoom_time, dt);
+
+    // Pan: drag the focus point along only when the creature's centre of mass leaves the dead
+    // zone, then ease the camera toward it.
+    let dead = DEAD_ZONE * zoom * window.width() / 2.0;
+    rig.focus_x = rig.focus_x.clamp(cx - dead, cx + dead);
+    let focus_x = rig.focus_x;
+    let x = smooth_damp(tf.translation.x, focus_x, &mut rig.vel_x, 0.35, dt);
+    tf.translation = Vec3::new(x, GROUND_OFFSET * zoom, tf.translation.z);
+    tf.scale = Vec3::splat(zoom);
 
     // Keep the readout above the creature and the same size on screen.
-    let readout_y = (4.25 * S).max(bounds.max.y + 0.9 * S * tf.scale.x);
+    let readout_y = (4.25 * S).max(bounds.max.y + 0.9 * S * zoom);
     if let Ok((mut ltf, mut text)) = label.single_mut() {
-        ltf.translation = Vec3::new(bounds.center().x, readout_y, ltf.translation.z);
+        ltf.translation = Vec3::new(cx, readout_y, ltf.translation.z);
         ltf.scale = tf.scale;
         text.0 = format!("{:.2} m", pb.sim.distance_m());
     }
     if let Ok(mut atf) = arrow.single_mut() {
-        atf.translation = Vec3::new(bounds.center().x, readout_y, atf.translation.z);
+        atf.translation = Vec3::new(cx, readout_y, atf.translation.z);
         atf.scale = tf.scale;
     }
 }

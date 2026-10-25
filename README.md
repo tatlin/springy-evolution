@@ -16,6 +16,7 @@ the original's rank-pairing lottery, then each survivor is cloned once and has o
     cargo run --release -- --seed 38 --pop 500
     cargo run --release -- --max-len 6     # allow longer muscles (default 2.0)
     cargo run --release -- --fixed-topology  # never add/remove nodes or muscles
+    cargo run --release -- --min-connections 0  # sparse regrowth, as in evolution3WEB
 
 ## Controls
 
@@ -72,6 +73,11 @@ nodes/muscles added and removed by mutation, overlapping muscles pruned, flat gr
 - Topology mutation (adding/removing nodes and muscles) runs in both presets. In evolution3WEB
   it was skipped along with the muscle-mutation loop, so every creature stayed at four nodes.
   `--fixed-topology` turns it off.
+- In evolution3WEB, `checkForLoneNodes()` only regrows enough muscles that no node has fewer
+  than two, so creatures end up as floppy chains. Here each node is braced to at least 3
+  others (`min_connections`), farthest first, so opposite corners get cross-braced and a
+  4-node creature gets back the truss's full bracing. Cary Huang's preset keeps 0.
+  `--min-connections` sets it for either preset.
 
 ## License
 

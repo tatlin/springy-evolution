@@ -112,6 +112,9 @@ pub struct Config {
     /// Whether children can gain or lose nodes and muscles. The original only does this in
     /// Cary Huang's version; here it is on for both presets.
     pub mutate_topology: bool,
+    /// After mutation, give every node muscles to at least this many others (farthest first, so
+    /// opposite corners get braced). 0 keeps the original's sparse regrowth.
+    pub min_connections: usize,
 }
 
 impl Config {
@@ -134,6 +137,7 @@ impl Config {
             inheritance: MuscleInheritance::Regrow,
             max_muscle_length: 2.0,
             mutate_topology: true,
+            min_connections: 3,
         }
     }
 
@@ -143,6 +147,7 @@ impl Config {
             rects: vec![],
             seed_mode: SeedMode::Random,
             inheritance: MuscleInheritance::Mutate,
+            min_connections: 0,
             ..Self::evolution3web()
         }
     }
@@ -387,6 +392,7 @@ impl Creature {
             child.check_for_overlap(true);
         }
         child.check_for_lone_nodes(rng, cfg);
+        child.brace(rng, cfg);
         child.settle(cfg);
         child
     }
@@ -436,6 +442,36 @@ impl Creature {
                     other = rng.index(n);
                 }
                 self.add_random_muscle(rng, cfg, Some((i, other)));
+            }
+        }
+    }
+
+    /// Connect each node to at least `cfg.min_connections` others, always to the farthest node
+    /// it isn't already joined to, so cross-bracing spans opposite corners.
+    fn brace(&mut self, rng: &mut Rng, cfg: &Config) {
+        let n = self.nodes.len();
+        let want = cfg.min_connections.min(n.saturating_sub(1));
+        for i in 0..n {
+            loop {
+                let partners: Vec<usize> = self
+                    .muscles
+                    .iter()
+                    .filter_map(|m| match (m.c1 == i, m.c2 == i) {
+                        (true, false) => Some(m.c2),
+                        (false, true) => Some(m.c1),
+                        _ => None,
+                    })
+                    .collect();
+                if partners.len() >= want {
+                    break;
+                }
+                let a = self.nodes[i];
+                let dist = |j: &usize| (self.nodes[*j].x - a.x).hypot(self.nodes[*j].y - a.y);
+                let farthest = (0..n)
+                    .filter(|j| *j != i && !partners.contains(j))
+                    .max_by(|j, k| dist(j).total_cmp(&dist(k)));
+                let Some(j) = farthest else { break };
+                self.add_random_muscle(rng, cfg, Some((i, j)));
             }
         }
     }
