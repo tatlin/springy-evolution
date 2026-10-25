@@ -21,7 +21,7 @@ the original's rank-pairing lottery, then each survivor is cloned once and has o
 ## Web
 
 Play it in the browser at <https://tatlin.github.io/springy-evolution/> (click the page first so
-it gets keyboard focus). Every push to `master` builds it for `wasm32-unknown-unknown` and deploys
+it gets keyboard focus). Every push to `main` builds it for `wasm32-unknown-unknown` and deploys
 it with `.github/workflows/pages.yml`. wasm has no threads, so the web build tests creatures on the
 main thread, about 10 ms per frame, instead of on a worker. To build it locally (the
 `wasm-bindgen` CLI must match the version in `Cargo.lock`):
