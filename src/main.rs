@@ -1,12 +1,15 @@
 //! Bevy front end: watch creatures run, breed generations in the background, plot progress.
 
 mod audio;
+mod fling;
+mod hud;
 mod levels;
 
 use audio::{AudioSettings, Landed, Milestone, SoundPlugin};
 use bevy::asset::AssetMetaCheck;
 use bevy::input::mouse::AccumulatedMouseScroll;
 use bevy::prelude::*;
+use hud::HudPlugin;
 use levels::{Level, LevelList, LevelsPlugin, Screen};
 use springy_evolution::sim::{self, Config, Creature, GenStats, Population, Sim};
 
@@ -28,6 +31,12 @@ const LANDING_SOUND_MIN_IMPACT: f32 = 0.012;
 const SLIP_SLACK: f32 = 0.1;
 /// A generation's best must fall this fraction below the previous best to count as a regression.
 const REGRESSION_DROP: f32 = 0.05;
+/// While auto-running, evolution pauses to show a new leader in full if it beats the last one shown
+/// by this fraction, and by at least `RECORD_STEP_MIN` metres. Smaller gains don't stop the clock.
+const RECORD_STEP_FRAC: f32 = 0.1;
+const RECORD_STEP_MIN: f32 = 0.1;
+/// Playback speed a level starts at (an index into `SPEEDS`): 2×.
+const LEVEL_SPEED: usize = 1;
 
 fn to_world(x: f32, y: f32) -> Vec2 {
     Vec2::new(x * S, -y * S)
@@ -48,6 +57,12 @@ impl Preset {
         match self {
             Preset::Evolution3Web => Config::evolution3web(),
             Preset::CaryHuang => Config::cary_huang(),
+        }
+    }
+    fn short_name(self) -> &'static str {
+        match self {
+            Preset::Evolution3Web => "evolution3WEB",
+            Preset::CaryHuang => "Cary Huang",
         }
     }
     fn name(self) -> &'static str {
@@ -102,11 +117,11 @@ impl Setup {
     }
 }
 
-/// Free play's setup and seed, from the command line.
+/// Free play's setup, and its seed if one was given with `--seed` (otherwise the player flings).
 #[derive(Resource)]
 struct FreePlay {
     setup: Setup,
-    seed: u64,
+    seed: Option<u64>,
 }
 
 #[derive(Resource)]
@@ -122,12 +137,18 @@ struct Evo {
     preview: Creature,
     auto: bool,
     generations_queued: u32,
+    /// Nothing evolves until the player flings the creature (or presses Space), which picks the seed.
+    awaiting_fling: bool,
     /// How many generations it took to reach the level's goal.
     finished_at: Option<usize>,
+    /// The creature that reached the goal, until the player has watched it cross the flag.
+    finale: Option<u64>,
+    /// Distance of the last leader watched to the end. Auto-run pauses for leaders that beat it.
+    shown_record: f32,
 }
 
 impl Evo {
-    fn new(setup: Setup, seed: u64) -> Self {
+    fn new(setup: Setup, seed: u64, awaiting_fling: bool) -> Self {
         let cfg = setup.config();
         let pop = Population::new(cfg.clone(), seed);
         Self {
@@ -138,10 +159,21 @@ impl Evo {
             pop: Some(pop),
             worker: None,
             history: Vec::new(),
-            auto: false,
+            // Evolving starts as soon as a level opens; `poll_worker` only runs in `Screen::Level`.
+            auto: true,
             generations_queued: 0,
+            awaiting_fling,
             finished_at: None,
+            finale: None,
+            shown_record: 0.0,
         }
+    }
+
+    /// Whether auto-run should wait for the leader to be shown before evolving further.
+    fn record_to_show(&self) -> bool {
+        let Some(i) = leader_gen(self) else { return false };
+        let step = (self.shown_record.abs() * RECORD_STEP_FRAC).max(RECORD_STEP_MIN);
+        self.history[i].best.fitness >= self.shown_record + step
     }
 
     fn busy(&self) -> bool {
@@ -217,10 +249,37 @@ fn random_seed() -> u64 {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Which {
+    /// The best creature from any generation so far: the record holder.
+    Leader,
     Best,
     Median,
     Worst,
 }
+
+/// Everything the player can do, from a key or an on-screen button. Keys and buttons both write
+/// these, and `apply_actions` (plus `audio` for sound) carries them out.
+#[derive(Message, Clone, Copy, PartialEq)]
+enum GameAction {
+    NextGen,
+    ToggleAuto,
+    Watch(Which),
+    EarlierGen,
+    LaterGen,
+    LatestGen,
+    Faster,
+    Slower,
+    Replay,
+    Restart,
+    /// Free play only.
+    SwitchPreset,
+    /// Sound on → music off → muted.
+    CycleSound,
+    Menu,
+}
+
+/// Whether the developer overlay (stats text, key list, percentile graph) shows. F3 toggles it.
+#[derive(Resource)]
+struct DebugUi(bool);
 
 #[derive(Resource)]
 struct View {
@@ -235,7 +294,10 @@ struct View {
 struct Playback {
     source: Creature,
     sim: Sim,
+    /// Long description for the debug overlay.
     label: String,
+    /// Short description for the player's button bar, such as "Watching the leader, from gen 19".
+    caption: String,
     /// Seconds spent holding the final pose.
     hold: f32,
     /// Simulation steps owed but not yet run, so playback follows real time at any frame rate.
@@ -245,20 +307,43 @@ struct Playback {
     behind: i32,
     /// Whether the creature has fallen back behind `metre` since passing it.
     slipped: bool,
+    /// Runs past the end of the 15 seconds: the kick-off creature, waiting to be flung.
+    free: bool,
+    /// A node the player is dragging, and where to (simulation units). See `fling.rs`.
+    grab: Option<(usize, Vec2)>,
+    /// The player poked this run, so its distance doesn't mean anything.
+    nudged: bool,
+    /// Played through to the end at least once.
+    watched: bool,
 }
 
 impl Playback {
-    fn new(source: &Creature, label: String) -> Self {
+    fn new(source: &Creature, label: String, caption: String) -> Self {
         Self {
             sim: Sim::new(source),
             source: source.clone(),
             label,
+            caption,
             hold: 0.0,
             owed: 0.0,
             metre: 0,
             behind: 0,
             slipped: false,
+            free: false,
+            grab: None,
+            nudged: false,
+            watched: false,
         }
+    }
+
+    /// An untested creature from generation 1, before anything has been evaluated.
+    fn preview(evo: &Evo) -> Self {
+        Self::new(&evo.preview, "Generation 1, creature #1 (untested)".into(), "Watching gen 1, untested".into())
+    }
+
+    /// The same creature from the start.
+    fn replay(&self) -> Self {
+        Self::new(&self.source, self.label.clone(), self.caption.clone())
     }
 }
 
@@ -292,20 +377,22 @@ fn main() {
     let arg = |name: &str| parse_arg::<u64>(&args, name);
     let preset =
         if args.iter().any(|a| a == "--cary") { Preset::CaryHuang } else { Preset::Evolution3Web };
-    let seed = arg("--seed").unwrap_or_else(random_seed);
+    let given_seed = arg("--seed");
     let population: usize = parse_arg(&args, "--pop").unwrap_or(1000);
 
+    let debug = debug_requested(&args);
     let max_muscle_length = parse_arg(&args, "--max-len");
     let fixed_topology = args.iter().any(|a| a == "--fixed-topology");
     let min_connections = parse_arg(&args, "--min-connections");
 
     let free =
         Setup { preset, population, max_muscle_length, fixed_topology, min_connections, level: None };
-    let evo = Evo::new(free.clone(), seed);
-    let playback = Playback::new(&evo.preview, "Generation 1, creature #1 (untested)".into());
+    // The menu plays this creature in the background; nothing evolves until a run starts.
+    let evo = Evo::new(free.clone(), given_seed.unwrap_or_else(random_seed), false);
+    let playback = Playback::preview(&evo);
 
-    App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
+    let mut app = App::new();
+    app.add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "Springy Evolution — Rust + Bevy".into(),
                 resolution: (1280u32, 720u32).into(),
@@ -318,29 +405,58 @@ fn main() {
             // There are no .meta files, and on the web each check is a failed HTTP request.
             meta_check: AssetMetaCheck::Never,
             ..default()
-        }))
-        .add_plugins((SoundPlugin, LevelsPlugin))
-        .insert_resource(FreePlay { setup: free, seed })
+        }));
+    // Inter replaces Bevy's built-in font, which has no arrows, stars or play symbols. It must go
+    // in before the first frame, when the text system reads the default font.
+    let inter = Font::from_bytes(include_bytes!("../assets/fonts/Inter-Regular.ttf").to_vec());
+    app.world_mut().resource_mut::<Assets<Font>>().insert(AssetId::default(), inter).unwrap();
+    app.add_plugins((SoundPlugin, LevelsPlugin, HudPlugin))
+        .add_message::<GameAction>()
+        .insert_resource(DebugUi(debug))
+        .insert_resource(FreePlay { setup: free, seed: given_seed })
         .insert_resource(ClearColor(Color::srgb_u8(120, 200, 255)))
         .insert_resource(evo)
         .insert_resource(playback)
-        .insert_resource(View { selected_gen: None, which: Which::Best, speed_idx: 0, zoom: 1.0 })
+        .insert_resource(View { selected_gen: None, which: Which::Leader, speed_idx: 0, zoom: 1.0 })
         .insert_resource(CameraRig { target_zoom: 1.0, last_view_zoom: 1.0, ..default() })
-        .add_systems(Startup, (setup, spawn_obstacles))
+        .init_resource::<fling::Grab>()
+        .add_systems(Startup, (setup, spawn_obstacles, spawn_record_marker))
         .add_systems(
             Update,
             (
-                input.run_if(in_state(Screen::Level)),
+                toggle_debug,
+                keyboard_input.run_if(in_state(Screen::Level)),
+                apply_actions.run_if(in_state(Screen::Level)),
+                fling::grab_input.run_if(in_state(Screen::Level)),
+                fling::kick_off.run_if(in_state(Screen::Level)),
                 poll_worker.run_if(in_state(Screen::Level)),
                 step_playback,
+                update_record_marker,
                 draw_creature,
                 follow_camera,
                 draw_graph,
                 update_hud,
             )
                 .chain(),
-        )
-        .run();
+        );
+    app.run();
+}
+
+/// `--debug` natively, or `?debug` in the page URL on the web.
+#[cfg(not(target_arch = "wasm32"))]
+fn debug_requested(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--debug")
+}
+
+#[cfg(target_arch = "wasm32")]
+fn debug_requested(_: &[String]) -> bool {
+    use js_sys::{JsString, Reflect};
+    let search = Reflect::get(&js_sys::global(), &JsString::from("location"))
+        .and_then(|location| Reflect::get(&location, &JsString::from("search")))
+        .ok()
+        .and_then(|search| search.as_string())
+        .unwrap_or_default();
+    search.trim_start_matches('?').split('&').any(|p| p == "debug" || p.starts_with("debug="))
 }
 
 fn setup(
@@ -355,7 +471,7 @@ fn setup(
         .with_children(|cam| {
             cam.spawn((
                 Sprite::from_color(Color::srgba(1.0, 1.0, 1.0, 0.75), Vec2::new(480.0, 230.0)),
-                Transform::from_xyz(390.0, 220.0, -10.0),
+                Transform::from_xyz(390.0, 190.0, -10.0),
                 GraphBackdrop,
             ));
         });
@@ -405,7 +521,8 @@ fn setup(
         Text::new(""),
         TextFont::from_font_size(15.0),
         TextColor(Color::BLACK),
-        Node { position_type: PositionType::Absolute, top: px(10.0), left: px(12.0), ..default() },
+        // Below the player's top bar.
+        Node { position_type: PositionType::Absolute, top: px(60.0), left: px(12.0), ..default() },
         Hud,
     ));
 }
@@ -448,19 +565,76 @@ fn spawn_obstacles(mut commands: Commands, evo: Res<Evo>, old: Query<Entity, Wit
     }
 }
 
-/// Start a fresh run of `setup`, watching an untested creature until the first generation is in.
+/// The flag at the best distance so far: what the creature on screen is trying to beat.
+#[derive(Component)]
+struct RecordMarker;
+#[derive(Component)]
+struct RecordLabel;
+
+fn spawn_record_marker(mut commands: Commands) {
+    let gold = Color::srgb_u8(240, 180, 20);
+    commands
+        .spawn((Transform::from_xyz(0.0, 0.0, 0.35), Visibility::Hidden, RecordMarker))
+        .with_children(|m| {
+            m.spawn((Sprite::from_color(gold, Vec2::new(0.06 * S, 3.0 * S)), Transform::from_xyz(0.0, 1.5 * S, 0.0)));
+            m.spawn((Sprite::from_color(gold, Vec2::new(1.0 * S, 0.5 * S)), Transform::from_xyz(0.5 * S, 2.75 * S, 0.0)));
+            m.spawn((
+                Text2d::new(""),
+                TextFont::from_font_size(30.0),
+                TextColor(Color::srgb_u8(80, 50, 0)),
+                Transform::from_xyz(0.5 * S, 2.75 * S, 0.1),
+                RecordLabel,
+            ));
+        });
+}
+
+fn update_record_marker(
+    evo: Res<Evo>,
+    screen: Res<State<Screen>>,
+    mut marker: Query<(&mut Transform, &mut Visibility), With<RecordMarker>>,
+    mut label: Query<&mut Text2d, With<RecordLabel>>,
+) {
+    let best = leader_gen(&evo).map(|i| evo.history[i].best.fitness).filter(|d| d.is_finite() && *d > 0.0);
+    let Ok((mut tf, mut vis)) = marker.single_mut() else { return };
+    let show = best.is_some() && *screen.get() != Screen::Menu;
+    vis.set_if_neq(if show { Visibility::Inherited } else { Visibility::Hidden });
+    let Some(best) = best else { return };
+    tf.translation.x = best * 5.0 * S;
+    if let Ok(mut text) = label.single_mut() {
+        let s = format!("{best:.2}");
+        if text.0 != s {
+            text.0 = s;
+        }
+    }
+}
+
+/// Start a fresh run of `setup`. With no seed, the creature waits for the player to fling it
+/// (`fling.rs`), and the fling picks the seed.
 fn start_run(
-    In((setup, seed)): In<(Setup, u64)>,
+    In((setup, seed)): In<(Setup, Option<u64>)>,
     mut evo: ResMut<Evo>,
     mut view: ResMut<View>,
     mut playback: ResMut<Playback>,
     mut commands: Commands,
 ) {
     // Any running worker is detached; its result is simply dropped.
-    *evo = Evo::new(setup, seed);
+    *evo = Evo::new(setup, seed.unwrap_or_else(random_seed), seed.is_none());
     view.selected_gen = None;
-    *playback = Playback::new(&evo.preview, "Generation 1, creature #1 (untested)".into());
+    view.which = Which::Leader;
+    if evo.setup.level.is_some() {
+        view.speed_idx = LEVEL_SPEED;
+    }
+    *playback = Playback::preview(&evo);
+    playback.free = evo.awaiting_fling;
     commands.run_system_cached(spawn_obstacles);
+}
+
+/// The fling (or Space) picked `seed`: build generation 1 from it and start evolving. The playback
+/// is left alone, so the flung creature keeps tumbling until the first generation is in.
+fn begin_evolution(In(seed): In<u64>, mut evo: ResMut<Evo>) {
+    if evo.awaiting_fling {
+        *evo = Evo::new(evo.setup.clone(), seed, false);
+    }
 }
 
 /// Start level `index` of `LevelList`, or free play for `None`.
@@ -475,7 +649,7 @@ fn enter_level(
         Some(i) => {
             let Some(level) = levels.0.get(i).and_then(|h| assets.get(h)) else { return };
             let run = LevelRun { index: i, level: level.clone() };
-            (Setup { level: Some(run), ..free.setup.clone() }, random_seed())
+            (Setup { level: Some(run), ..free.setup.clone() }, None)
         }
         None => (free.setup.clone(), free.seed),
     };
@@ -486,11 +660,34 @@ fn enter_level(
 // Systems
 // ------------------------------------------------------------------------------------------------
 
-fn watch_target(evo: &Evo, view: &View) -> Option<(Creature, String)> {
-    let idx = view.selected_gen.unwrap_or(evo.history.len().checked_sub(1)?);
+/// Index of the generation whose best scored highest. Ties go to the earliest, so the leader only
+/// changes on a strictly better score.
+fn leader_gen(evo: &Evo) -> Option<usize> {
+    let mut leader = None;
+    for (i, s) in evo.history.iter().enumerate() {
+        if leader.is_none_or(|l: usize| s.percentiles[0] > evo.history[l].percentiles[0]) {
+            leader = Some(i);
+        }
+    }
+    leader
+}
+
+/// The generation being watched: the leader's, a browsed one, or the latest.
+fn watched_gen(evo: &Evo, view: &View) -> Option<usize> {
+    match (view.selected_gen, view.which) {
+        (Some(i), _) => Some(i),
+        (None, Which::Leader) => leader_gen(evo),
+        (None, _) => evo.history.len().checked_sub(1),
+    }
+}
+
+/// A playback of the creature the view points at, or `None` before the first generation.
+fn watch_target(evo: &Evo, view: &View) -> Option<Playback> {
+    let idx = watched_gen(evo, view)?;
     let stats = evo.history.get(idx)?;
     let (c, name) = match view.which {
-        Which::Best => (&stats.best, "best"),
+        Which::Leader if view.selected_gen.is_none() => (&stats.best, "leader: best"),
+        Which::Leader | Which::Best => (&stats.best, "best"),
         Which::Median => (&stats.median, "median"),
         Which::Worst => (&stats.worst, "worst"),
     };
@@ -500,58 +697,43 @@ fn watch_target(evo: &Evo, view: &View) -> Option<(Creature, String)> {
         c.species(),
         c.fitness
     );
-    Some((c.clone(), label))
+    let caption = match (view.which, view.selected_gen) {
+        (Which::Leader, None) => format!("Watching the leader, from gen {}", idx + 1),
+        (Which::Leader | Which::Best, _) => format!("Watching gen {}'s best", idx + 1),
+        (Which::Median, _) => format!("Watching gen {}'s median", idx + 1),
+        (Which::Worst, _) => format!("Watching gen {}'s worst", idx + 1),
+    };
+    Some(Playback::new(c, label, caption))
 }
 
-fn input(
+/// Keys write the same actions as the on-screen buttons. Zoom stays here: it has no button.
+fn keyboard_input(
     keys: Res<ButtonInput<KeyCode>>,
     scroll: Res<AccumulatedMouseScroll>,
     time: Res<Time>,
-    mut evo: ResMut<Evo>,
     mut view: ResMut<View>,
-    mut playback: ResMut<Playback>,
-    mut commands: Commands,
+    mut actions: MessageWriter<GameAction>,
 ) {
-    let mut retarget = false;
-
-    if keys.just_pressed(KeyCode::Space) {
-        evo.generations_queued += 1;
-    }
-    if keys.just_pressed(KeyCode::KeyA) {
-        evo.auto = !evo.auto;
-    }
-    for (key, which) in
-        [(KeyCode::Digit1, Which::Best), (KeyCode::Digit2, Which::Median), (KeyCode::Digit3, Which::Worst)]
-    {
+    const KEYS: [(KeyCode, GameAction); 14] = [
+        (KeyCode::Space, GameAction::NextGen),
+        (KeyCode::KeyA, GameAction::ToggleAuto),
+        (KeyCode::KeyL, GameAction::Watch(Which::Leader)),
+        (KeyCode::Digit1, GameAction::Watch(Which::Best)),
+        (KeyCode::Digit2, GameAction::Watch(Which::Median)),
+        (KeyCode::Digit3, GameAction::Watch(Which::Worst)),
+        (KeyCode::ArrowLeft, GameAction::EarlierGen),
+        (KeyCode::ArrowRight, GameAction::LaterGen),
+        (KeyCode::End, GameAction::LatestGen),
+        (KeyCode::ArrowUp, GameAction::Faster),
+        (KeyCode::ArrowDown, GameAction::Slower),
+        (KeyCode::Enter, GameAction::Replay),
+        (KeyCode::KeyR, GameAction::Restart),
+        (KeyCode::KeyP, GameAction::SwitchPreset),
+    ];
+    for (key, action) in KEYS {
         if keys.just_pressed(key) {
-            view.which = which;
-            retarget = true;
+            actions.write(action);
         }
-    }
-    let n = evo.history.len();
-    if n > 0 {
-        if keys.just_pressed(KeyCode::ArrowLeft) {
-            view.selected_gen = Some(view.selected_gen.unwrap_or(n - 1).saturating_sub(1));
-            retarget = true;
-        }
-        if keys.just_pressed(KeyCode::ArrowRight) {
-            let next = view.selected_gen.unwrap_or(n - 1) + 1;
-            view.selected_gen = if next >= n - 1 { None } else { Some(next) };
-            retarget = true;
-        }
-        if keys.just_pressed(KeyCode::End) {
-            view.selected_gen = None;
-            retarget = true;
-        }
-    }
-    if keys.just_pressed(KeyCode::ArrowUp) {
-        view.speed_idx = (view.speed_idx + 1).min(SPEEDS.len() - 1);
-    }
-    if keys.just_pressed(KeyCode::ArrowDown) {
-        view.speed_idx = view.speed_idx.saturating_sub(1);
-    }
-    if keys.just_pressed(KeyCode::Enter) {
-        *playback = Playback::new(&playback.source.clone(), playback.label.clone());
     }
 
     // Zoom (wheel or -/=).
@@ -564,28 +746,89 @@ fn input(
     }
     z -= scroll.delta.y.clamp(-5.0, 5.0) * 0.05;
     view.zoom = (view.zoom * (1.0 + z)).clamp(0.3, 8.0);
+}
 
-    // Restart (R), or switch preset (P) in free play.
-    let restart = keys.just_pressed(KeyCode::KeyR);
-    let switch = keys.just_pressed(KeyCode::KeyP) && evo.setup.level.is_none();
-    if restart || switch {
-        let mut setup = evo.setup.clone();
-        if switch {
-            setup.preset = match setup.preset {
-                Preset::Evolution3Web => Preset::CaryHuang,
-                Preset::CaryHuang => Preset::Evolution3Web,
-            };
-        }
-        let seed = evo.seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        commands.run_system_cached_with(start_run, (setup, seed));
-        return;
+fn toggle_debug(keys: Res<ButtonInput<KeyCode>>, mut debug: ResMut<DebugUi>) {
+    if keys.just_pressed(KeyCode::F3) {
+        debug.0 = !debug.0;
     }
+}
 
-    if retarget {
-        if let Some((c, label)) = watch_target(&evo, &view) {
-            *playback = Playback::new(&c, label);
+fn apply_actions(
+    mut actions: MessageReader<GameAction>,
+    mut evo: ResMut<Evo>,
+    mut view: ResMut<View>,
+    mut playback: ResMut<Playback>,
+    mut screen: ResMut<NextState<Screen>>,
+    mut commands: Commands,
+) {
+    let mut retarget = false;
+    for action in actions.read() {
+        let n = evo.history.len();
+        match *action {
+            // Before the fling, either one skips it with a random seed.
+            GameAction::NextGen | GameAction::ToggleAuto if evo.awaiting_fling => {
+                commands.run_system_cached_with(begin_evolution, random_seed());
+            }
+            GameAction::NextGen => evo.generations_queued += 1,
+            GameAction::ToggleAuto => evo.auto = !evo.auto,
+            GameAction::Watch(which) => {
+                view.which = which;
+                // The leader spans every generation, so watching it stops browsing.
+                if which == Which::Leader {
+                    view.selected_gen = None;
+                }
+                retarget = true;
+            }
+            GameAction::EarlierGen | GameAction::LaterGen if n > 0 => {
+                // Browse from whichever generation is on screen.
+                let at = watched_gen(&evo, &view).unwrap_or(n - 1);
+                view.selected_gen = if *action == GameAction::EarlierGen {
+                    Some(at.saturating_sub(1))
+                } else if at + 1 >= n - 1 {
+                    None
+                } else {
+                    Some(at + 1)
+                };
+                if view.which == Which::Leader {
+                    view.which = Which::Best;
+                }
+                retarget = true;
+            }
+            GameAction::LatestGen => {
+                view.selected_gen = None;
+                retarget = true;
+            }
+            GameAction::Faster => view.speed_idx = (view.speed_idx + 1).min(SPEEDS.len() - 1),
+            GameAction::Slower => view.speed_idx = view.speed_idx.saturating_sub(1),
+            GameAction::Replay => *playback = playback.replay(),
+            GameAction::Restart | GameAction::SwitchPreset => {
+                let mut setup = evo.setup.clone();
+                if *action == GameAction::SwitchPreset {
+                    if setup.level.is_some() {
+                        continue;
+                    }
+                    setup.preset = match setup.preset {
+                        Preset::Evolution3Web => Preset::CaryHuang,
+                        Preset::CaryHuang => Preset::Evolution3Web,
+                    };
+                }
+                // A new attempt starts with a new fling.
+                commands.run_system_cached_with(start_run, (setup, None));
+                return;
+            }
+            GameAction::Menu => screen.set(Screen::Menu),
+            GameAction::EarlierGen | GameAction::LaterGen | GameAction::CycleSound => {}
         }
     }
+    if retarget && let Some(target) = watch_target(&evo, &view) {
+        *playback = target;
+    }
+}
+
+/// "Keep evolving" on the results screen goes back to auto-running.
+fn resume_auto(mut evo: ResMut<Evo>) {
+    evo.auto = true;
 }
 
 fn poll_worker(
@@ -593,7 +836,6 @@ fn poll_worker(
     mut view: ResMut<View>,
     mut playback: ResMut<Playback>,
     mut milestones: MessageWriter<Milestone>,
-    mut screen: ResMut<NextState<Screen>>,
 ) {
     let mut goal = false;
     let finished = evo.worker.take().and_then(|w| w.poll().map_err(|w| evo.worker = Some(w)).ok());
@@ -609,34 +851,40 @@ fn poll_worker(
                 }
             }
             evo.history.push(stats.clone());
-            // Reaching a level's goal stops evolving and shows the results over the winning run.
+            // Reaching a level's goal stops evolving and plays the winner. The results show when
+            // the player sees it cross the flag (`step_playback`).
             let target = evo.setup.level.as_ref().map(|run| run.level.goal);
             if let Some(target) = target
                 && evo.finished_at.is_none()
                 && best >= target
             {
                 evo.finished_at = Some(evo.history.len());
+                evo.finale = Some(stats.best.id);
                 evo.auto = false;
                 evo.generations_queued = 0;
                 view.selected_gen = None;
-                view.which = Which::Best;
+                view.which = Which::Leader;
                 goal = true;
-                milestones.write(Milestone::GoalReached);
-                screen.set(Screen::Results);
             }
         }
         evo.pop = Some(pop);
-        // When following the latest generation, start watching the new champion — but don't
-        // interrupt a replay in progress while auto-running unless it has finished.
-        if goal
-            || view.selected_gen.is_none() && (!evo.auto || playback.hold > 0.0 || evo.history.len() == 1)
+        // Stepping by hand, show a new target straight away. While auto-running, `step_playback`
+        // moves on when the current replay ends, so runs aren't cut off mid-way.
+        let first = evo.history.len() == 1;
+        if (goal || view.selected_gen.is_none() && (!evo.auto || first))
+            && let Some(target) = watch_target(&evo, &view)
+            && (goal || first || target.source.id != playback.source.id)
         {
-            if let Some((c, label)) = watch_target(&evo, &view) {
-                *playback = Playback::new(&c, label);
-            }
+            *playback = target;
         }
     }
-    if !evo.busy() && (evo.auto || evo.generations_queued > 0) {
+    // Auto-run pauses while a new leader is shown, so each real step forward gets watched.
+    let paced = evo.auto
+        && view.which == Which::Leader
+        && view.selected_gen.is_none()
+        && view.speed_idx < SPEEDS.len() - 1
+        && evo.record_to_show();
+    if !evo.busy() && !evo.awaiting_fling && !paced && (evo.auto || evo.generations_queued > 0) {
         evo.generations_queued = evo.generations_queued.saturating_sub(1);
         evo.start_generation();
     }
@@ -647,14 +895,16 @@ fn on_ground(n: &sim::Node) -> bool {
 }
 
 fn step_playback(
-    evo: Res<Evo>,
-    view: Res<View>,
+    mut evo: ResMut<Evo>,
+    mut view: ResMut<View>,
     time: Res<Time>,
     mut pb: ResMut<Playback>,
     mut landed: MessageWriter<Landed>,
     mut milestones: MessageWriter<Milestone>,
+    mut screen: ResMut<NextState<Screen>>,
 ) {
-    let steps = evo.cfg.sim_steps;
+    // The kick-off creature runs until it's flung and the first generation is in.
+    let steps = if pb.free { u32::MAX } else { evo.cfg.sim_steps };
     let dt = time.delta_secs();
     if pb.sim.timer < steps {
         let speed = SPEEDS[view.speed_idx] as f32;
@@ -666,6 +916,7 @@ fn step_playback(
         let thuds = SPEEDS[view.speed_idx] <= LANDING_SOUND_MAX_SPEED;
         while pb.owed >= 1.0 && pb.sim.timer < steps {
             pb.owed -= 1.0;
+            fling::steer(&mut pb);
             if !thuds {
                 pb.sim.step(&evo.cfg);
                 continue;
@@ -705,11 +956,31 @@ fn step_playback(
             if pb.sim.timer >= steps && d < 0.0 {
                 say(Milestone::EndedBehind);
             }
+            // The level ends when the player sees the winner cross the flag, not when it's scored.
+            let goal = evo.setup.level.as_ref().map_or(f32::INFINITY, |run| run.level.goal);
+            if evo.finale == Some(pb.source.id) && !pb.nudged && d >= goal {
+                evo.finale = None;
+                milestones.write(Milestone::GoalReached);
+                screen.set(Screen::Results);
+            }
+        }
+        if pb.sim.timer >= steps && !pb.watched {
+            pb.watched = true;
+            // Watching a leader to the end lets auto-run carry on (see `Evo::record_to_show`).
+            if leader_gen(&evo).is_some_and(|i| evo.history[i].best.id == pb.source.id) {
+                evo.shown_record = evo.shown_record.max(pb.source.fitness);
+            }
         }
     } else {
         pb.hold += dt;
         if pb.hold > HOLD_SECS {
-            *pb = Playback::new(&pb.source.clone(), pb.label.clone());
+            // A finale nobody saw (the player looked away, or poked it) plays again.
+            if evo.finale.is_some() {
+                view.selected_gen = None;
+                view.which = Which::Leader;
+            }
+            // Replay, or move on to whatever the view points at now (a new leader, say).
+            *pb = watch_target(&evo, &view).unwrap_or_else(|| pb.replay());
         }
     }
 }
@@ -830,6 +1101,8 @@ fn smooth_damp(current: f32, target: f32, vel: &mut f32, smooth_time: f32, dt: f
     target + (change + temp) * decay
 }
 
+type ArrowOnly = (With<DistanceArrow>, Without<DistanceLabel>);
+
 /// Camera follow state that persists between frames.
 #[derive(Resource, Default)]
 struct CameraRig {
@@ -849,7 +1122,7 @@ fn follow_camera(
     window: Query<&Window, With<bevy::window::PrimaryWindow>>,
     mut cam: Query<&mut Transform, (With<Camera2d>, Without<DistanceLabel>, Without<DistanceArrow>)>,
     mut label: Query<(&mut Transform, &mut Text2d), (With<DistanceLabel>, Without<DistanceArrow>)>,
-    mut arrow: Query<&mut Transform, (With<DistanceArrow>, Without<DistanceLabel>)>,
+    mut arrow: Query<(&mut Transform, &mut Sprite), ArrowOnly>,
 ) {
     let cx = pb.sim.center_x() * S;
     let Some(bounds) = creature_bounds(&pb).filter(|_| cx.is_finite()) else { return };
@@ -886,9 +1159,11 @@ fn follow_camera(
         ltf.scale = tf.scale;
         text.0 = format!("{:.2} m", pb.sim.distance_m());
     }
-    if let Ok(mut atf) = arrow.single_mut() {
+    if let Ok((mut atf, mut sprite)) = arrow.single_mut() {
         atf.translation = Vec3::new(cx, readout_y, atf.translation.z);
         atf.scale = tf.scale;
+        // Grey once poked: the distance no longer means anything.
+        sprite.color = if pb.nudged { Color::srgb_u8(130, 130, 140) } else { Color::srgb_u8(120, 0, 255) };
     }
 }
 
@@ -896,16 +1171,17 @@ fn draw_graph(
     evo: Res<Evo>,
     view: Res<View>,
     screen: Res<State<Screen>>,
+    debug: Res<DebugUi>,
     cam: Query<&Transform, With<Camera2d>>,
     mut backdrop: Query<&mut Visibility, With<GraphBackdrop>>,
     mut g: Gizmos,
 ) {
     let Ok(cam) = cam.single() else { return };
-    let in_menu = *screen.get() == Screen::Menu;
+    let show = debug.0 && *screen.get() != Screen::Menu;
     for mut vis in &mut backdrop {
-        *vis = if in_menu { Visibility::Hidden } else { Visibility::Inherited };
+        *vis = if show { Visibility::Inherited } else { Visibility::Hidden };
     }
-    if in_menu {
+    if !show {
         return;
     }
     let h = &evo.history;
@@ -916,7 +1192,7 @@ fn draw_graph(
     let z = cam.scale.x;
     let origin = cam.translation.truncate();
     // Graph box in screen pixels relative to the camera centre (matches the backdrop sprite).
-    let (x0, x1, y0, y1) = (170.0, 610.0, 120.0, 320.0);
+    let (x0, x1, y0, y1) = (170.0, 610.0, 90.0, 290.0);
     let lines: [(usize, Color); 5] = [
         (28, Color::srgb(0.35, 0.35, 0.35)),
         (18, Color::srgb(0.2, 0.2, 0.2)),
@@ -953,11 +1229,16 @@ fn update_hud(
     pb: Res<Playback>,
     sound: Res<AudioSettings>,
     screen: Res<State<Screen>>,
+    debug: Res<DebugUi>,
     mut hud: Query<(&mut Text, &mut Visibility), With<Hud>>,
 ) {
     let Ok((mut text, mut vis)) = hud.single_mut() else { return };
-    // The menu sits over the running creature; keep the screen clear for it.
-    *vis = if *screen.get() == Screen::Menu { Visibility::Hidden } else { Visibility::Inherited };
+    // Developer overlay only, and never over the menu.
+    let show = debug.0 && *screen.get() != Screen::Menu;
+    *vis = if show { Visibility::Inherited } else { Visibility::Hidden };
+    if !show {
+        return;
+    }
     let mut s = match &evo.setup.level {
         Some(run) => {
             let l = &run.level;
@@ -1005,8 +1286,8 @@ fn update_hud(
         (true, true) => "Sound: muted\n".to_string(),
         (true, false) => format!("Sound: music {}%   effects {}%\n", pct(sound.music), pct(sound.sfx)),
     };
-    s += "[Space] next gen   [A] auto   [1/2/3] best/median/worst   [←/→/End] browse gens\n\
+    s += "[Space] next gen   [A] auto   [L] leader   [1/2/3] best/median/worst   [←/→/End] browse gens\n\
           [↑/↓] speed   [Enter] replay   [wheel or -/=] zoom   [R] restart   [Esc] level select\n\
-          [P] switch preset (free play)   [M] mute   [,/.] music volume   [[/]] effects volume";
+          [P] switch preset (free play)   [M] mute   [,/.] music volume   [[/]] effects volume   [F3] hide this";
     text.0 = s;
 }

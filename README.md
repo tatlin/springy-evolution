@@ -20,6 +20,9 @@ only affect free play; levels always use the same settings so their stars are co
     cargo run --release -- --max-len 6     # allow longer muscles (default 2.0)
     cargo run --release -- --fixed-topology  # never add/remove nodes or muscles
     cargo run --release -- --min-connections 0  # sparse regrowth, as in evolution3WEB
+    cargo run --release -- --debug      # start with the developer overlay on (F3 toggles it)
+
+On the web, add `?debug` to the page URL for the same overlay.
 
 ## Web
 
@@ -70,13 +73,30 @@ level, add its file to `LEVEL_FILES` in `src/levels.rs` (the browser can't list 
 
 ## Controls
 
+A run starts with a fling: grab the creature with the mouse or a finger and throw it. The gesture
+becomes the run's random seed (shown in the top bar), and once the creature has tumbled for a
+moment, evolution starts on its own. Space skips the fling and picks a random seed. Restart and
+Retry ask for a new fling.
+
+You watch the leader: the best creature from any generation so far. Whenever evolution finds a
+leader that beats the last one shown by at least 10% (and 0.1 m), it pauses and plays that run in
+full, so the game moves through quiet stretches quickly and stops for real progress. A gold flag
+on the course marks the best distance so far. In a level, the results screen appears when you see
+the winning creature cross the goal flag. Levels start at 2× playback speed.
+
+You can also grab the creature during any replay and yank it around. That doesn't affect
+evolution; the run is marked "nudged" and its distance readout turns grey. A status bar along the top shows the level, the generation, the best distance and
+what the next star needs. A button bar along the bottom covers everything below except zoom and
+the fine volume keys, so the game also works with a mouse or a touch screen.
+
 | Key | Action |
 |---|---|
 | 1–4, F | menu: start a level, or free play |
 | Esc | back to the level select |
 | Space | simulate one generation (queues if pressed repeatedly) |
-| A | auto-run generations continuously |
-| 1 / 2 / 3 | watch the best / median / worst creature |
+| A | toggle auto-run (on by default) |
+| L | watch the leader (the default) |
+| 1 / 2 / 3 | watch the latest generation's best / median / worst creature |
 | ← / → / End | browse earlier generations / back to latest |
 | ↑ / ↓ | playback speed (1× … 64×, or instant) |
 | Enter | replay |
@@ -86,8 +106,9 @@ level, add its file to `LEVEL_FILES` in `src/levels.rs` (the browser can't list 
 | M | mute / unmute |
 | , / . | music volume down / up |
 | [ / ] | effects volume down / up |
+| F3 | developer overlay: stats, key list, percentile graph |
 
-On the results screen: Space keeps evolving, Enter retries, N goes to the next level, and Esc
+The sound button cycles between sound on, music off and muted. On the results screen: Space keeps evolving, Enter retries, N goes to the next level, and Esc
 returns to the menu. Menu and results buttons can also be clicked.
 
 ## Sound
@@ -119,7 +140,11 @@ replacing the synthesized ones with designed audio.
   Playback follows real time at any frame rate (60 sim steps per second at 1×).
 - `src/audio.rs` — synthesized sound effects, procedural music, and the volume controls.
 - `src/levels.rs` — level files, the menu and results screens, and stars.
+- `src/hud.rs` — the in-level status bar and button bar.
+- `src/fling.rs` — grabbing the creature: the kick-off fling and poking during replays.
 - `assets/levels/` — the courses.
+- `assets/fonts/` — Inter (SIL Open Font License), built into the binary as the UI font.
+- `docs/` — design notes: the [player UI](docs/ui.md) and the [sound list](docs/sounds.md).
 
 ## The two presets
 

@@ -22,7 +22,24 @@ browser at <https://tatlin.github.io/springy-evolution/>.
   and it writes the audio messages as it steps. A run is built from a `Setup` (free play's preset
   and CLI overrides, or a `LevelRun`): `start_run` replaces `Evo`, and `enter_level` builds the
   setup for a level index or free play. `poll_worker` detects a level's goal, sets
-  `Evo::finished_at`, and switches to `Screen::Results`.
+  `Evo::finished_at`, and switches to `Screen::Results`. Every player command is a `GameAction`
+  message: `keyboard_input` and the HUD buttons write them, `apply_actions` carries them out
+  (`audio::cycle_sound` handles the sound button). `View::which` defaults to `Which::Leader` (the
+  best creature of any generation, `leader_gen`). While auto-running, the playback only moves to a
+  new target when its replay ends (`step_playback`), so `Playback::caption` describes what's
+  actually playing. `DebugUi` gates the old text HUD and graph (F3, `--debug`, `?debug`).
+- `src/fling.rs`: grabbing nodes with the mouse or touch. `grab_input` hit-tests nodes (and skips
+  presses on button rectangles), `steer` pulls the held node toward the pointer before each
+  playback step, and `kick_off` starts evolution (`begin_evolution`) a moment after a fling, with
+  the gesture hashed into the seed. A run starts with `Evo::awaiting_fling`; `start_run` takes
+  `Option<u64>`, and `None` means "wait for a fling". Only the playback sim is touched.
+- Pacing lives in `main.rs`. `poll_worker` holds auto-run while `Evo::record_to_show()` says a leader
+  beats `shown_record` by `RECORD_STEP_FRAC`/`RECORD_STEP_MIN`; `step_playback` updates
+  `shown_record` when a leader's replay reaches the end (`Playback::watched`). Reaching the goal
+  sets `Evo::finale`, and `step_playback` shows the results when that creature, un-nudged, passes
+  the goal distance on screen. That's also where `Milestone::GoalReached` is sent.
+- `src/hud.rs`: `HudPlugin`, the top status bar and bottom button bar (`docs/ui.md` has the design).
+  Buttons carry a `HudButton(GameAction)` and are restyled from game state each frame.
 - `src/levels.rs`: `LevelsPlugin`. The `Level` asset and its RON loader (`*.level.ron`), the
   `Screen` state (Menu → Level → Results), the menu and results UI, keyboard shortcuts, session
   stars (`Progress`), and hot reload of the level being played. `input` and `poll_worker` only
@@ -37,6 +54,7 @@ browser at <https://tatlin.github.io/springy-evolution/>.
   sound is a `Synth` asset (a custom `Decodable`) generated in code, one tiny asset per one-shot,
   plus an endless procedural music loop. `AudioSettings` holds mute, the music and effects
   volumes, and `unlocked`.
+- `docs/ui.md`: the player UI design (bars, debug overlay, actions).
 - `docs/sounds.md`: the sound-design list (what plays now, what's planned, specs for a designer).
   Update its status column when you add or replace a sound.
 - `web/index.html`: the page that loads the wasm build, focuses Bevy's canvas, and resumes the
@@ -97,6 +115,16 @@ by the workflow.
 - `bevy::ui_widgets::Button` activates on release only if its `Pressed` marker is still there at
   click time. A press and release in the same frame (browser automation, fast taps) misses it, so
   our buttons use `ActivateOnPress`.
+- Inter replaces Bevy's built-in font by inserting it at `AssetId::default()` in `main()`, right after
+  `DefaultPlugins`. It must happen before the first frame: the text system copies each font into its
+  collection once, by id, and won't notice a later replacement. FiraMono (Bevy's default) has no
+  arrows, stars or ×, which showed as empty boxes.
+- Browser automation's drag is instant: the press, the move and the release land in one frame, so
+  the game reads the cursor at the end point and a drag never grabs a node (a plain click on a node
+  does). Synthetic `PointerEvent`s from JavaScript are ignored by winit. A real multi-frame fling
+  can only be tested by hand.
+- Picking handles one press per frame per pointer, so two automated clicks in one frame register
+  as one. Leave a short wait between clicks when testing.
 - A local variable named `setup` in `main()` shadows the `setup` system, and the error is an
   unhelpful "does not describe a valid system configuration".
 - Level difficulty comes almost entirely from obstacles. On flat ground creatures reach 1 m in about

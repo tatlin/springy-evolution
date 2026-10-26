@@ -49,6 +49,8 @@ pub enum Milestone {
 #[derive(Resource)]
 pub struct AudioSettings {
     pub muted: bool,
+    /// Music silenced but effects still playing (the sound button's middle setting).
+    pub music_off: bool,
     /// Music and effects volumes, 0..1.
     pub music: f32,
     pub sfx: f32,
@@ -59,7 +61,7 @@ pub struct AudioSettings {
 
 impl AudioSettings {
     fn music_volume(&self) -> Volume {
-        Volume::Linear(if self.muted { 0.0 } else { self.music * self.music })
+        Volume::Linear(if self.muted || self.music_off { 0.0 } else { self.music * self.music })
     }
     fn sfx_gain(&self) -> f32 {
         if self.muted { 0.0 } else { self.sfx * self.sfx }
@@ -75,12 +77,13 @@ impl Plugin for SoundPlugin {
             .add_message::<Milestone>()
             .insert_resource(AudioSettings {
                 muted: false,
+                music_off: false,
                 music: 0.5,
                 sfx: 0.8,
                 unlocked: !cfg!(target_arch = "wasm32"),
             })
             .init_resource::<SfxState>()
-            .add_systems(Update, (unlock, volume_keys, start_music, apply_music_volume, play_sfx).chain());
+            .add_systems(Update, (unlock, volume_keys, cycle_sound, start_music, apply_music_volume, play_sfx).chain());
     }
 }
 
@@ -136,6 +139,17 @@ fn volume_keys(keys: Res<ButtonInput<KeyCode>>, mut settings: ResMut<AudioSettin
         if keys.just_pressed(key) {
             settings.sfx = step(settings.sfx, up);
         }
+    }
+}
+
+/// The sound button: on → music off → muted → on.
+fn cycle_sound(mut actions: MessageReader<crate::GameAction>, mut settings: ResMut<AudioSettings>) {
+    for _ in actions.read().filter(|a| **a == crate::GameAction::CycleSound) {
+        (settings.music_off, settings.muted) = match (settings.music_off, settings.muted) {
+            (false, false) => (true, false),
+            (true, false) => (true, true),
+            _ => (false, false),
+        };
     }
 }
 

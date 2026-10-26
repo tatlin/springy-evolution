@@ -195,7 +195,10 @@ fn perform(action: UiAction, evo: &crate::Evo, count: usize, next: &mut NextStat
                 play(Some(i), next, commands);
             }
         }
-        UiAction::KeepEvolving => next.set(Screen::Level),
+        UiAction::KeepEvolving => {
+            commands.run_system_cached(crate::resume_auto);
+            next.set(Screen::Level);
+        }
         UiAction::Menu => next.set(Screen::Menu),
         UiAction::Play(_) => {}
     }
@@ -331,19 +334,17 @@ fn button(action: UiAction) -> impl Bundle {
     )
 }
 
-/// Three dots, the first `n` gold. (The default font has no star glyph.)
+/// Three stars, the first `n` gold.
 fn star_row(parent: &mut ChildSpawnerCommands, n: u8, size: f32) {
-    parent.spawn(Node { column_gap: px(size * 0.3), ..default() }).with_children(|row| {
+    parent.spawn(Node { column_gap: px(size * 0.15), ..default() }).with_children(|row| {
         for i in 0..3 {
-            row.spawn((
-                Node { width: px(size), height: px(size), border_radius: BorderRadius::MAX, ..default() },
-                BackgroundColor(if i < n { GOLD } else { EMPTY_STAR }),
-            ));
+            row.spawn(text("★", size, if i < n { GOLD } else { EMPTY_STAR }));
         }
     });
 }
 
-type HoverChanged = (Changed<Hovered>, With<Button>);
+/// Menu and results buttons only; the in-level bar styles its own (see `hud.rs`).
+type HoverChanged = (Changed<Hovered>, With<UiAction>);
 
 fn button_hover(mut buttons: Query<(&Hovered, &mut BackgroundColor), HoverChanged>) {
     for (hovered, mut color) in &mut buttons {
